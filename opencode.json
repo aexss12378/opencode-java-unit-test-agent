@@ -1,0 +1,11 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "default_agent": "unit-test",
+  "instructions": [
+    "PLAN.md"
+  ],
+  "permission": {
+    "external_directory": "deny"
+  }
+}
+
