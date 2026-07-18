@@ -1,4 +1,0 @@
-interface:
-  display_name: "Java 單元測試"
-  short_description: "為舊版 Maven 專案分析、產生並嚴格驗證單元測試"
-  default_prompt: "使用 $java-unit-testing 分析指定 Java 程式，經人工核准後建立並驗證單元測試。"
