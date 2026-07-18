@@ -11,10 +11,10 @@
 ./mvnw -B -ntp org.pitest:pitest-maven:mutationCoverage
 ```
 
-在這個目錄啟動 OpenCode 後，可執行：
+在這個目錄啟動 OpenCode，確認目前代理為 `unit-test` 後，直接輸入：
 
 ```text
-/unit-test 請為 OrderPricingService 補上依正式規格設計的單元測試
+請為 OrderPricingService 補上依正式規格設計的單元測試
 ```
 
 代理會先提出附來源與分類的測試意圖，等待人工核准。建立候選測試後，OpenCode 會再顯示 `submit_unit_tests` 權限確認；只有工具回傳 `published` 才表示測試檔已加入專案。
