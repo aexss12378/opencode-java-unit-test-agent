@@ -1,6 +1,7 @@
 ---
 description: 依嚴格規格證據與人工核准流程，為舊版 Maven Java 專案建立及驗證單元測試。
 mode: primary
+model: ollama-cloud/qwen3.5:397b
 temperature: 0.1
 steps: 40
 permission:
