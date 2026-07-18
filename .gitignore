@@ -1,3 +1,7 @@
 target/
 .DS_Store
 .opencode/test-agent-runs/
+.opencode/node_modules/
+.opencode/package-lock.json
+.opencode/bun.lock
+.opencode/.gitignore

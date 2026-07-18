@@ -27,8 +27,6 @@ permission:
     "git ls-files": allow
     "git ls-files *": allow
     "rg *": allow
-    "uv run --no-project python .opencode/skills/java-unit-testing/scripts/inspect_maven_project.py *": allow
-    "uv run --no-project python .opencode/skills/java-unit-testing/scripts/repo_change_guard.py *": allow
     "./mvnw *": ask
     "mvn *": ask
   task: deny

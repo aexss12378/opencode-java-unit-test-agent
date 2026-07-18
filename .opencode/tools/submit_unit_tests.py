@@ -19,8 +19,6 @@ import xml.etree.ElementTree as ET
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-import inspect_maven_project as inspector
-
 
 MAX_FILE_BYTES = 100_000
 MAX_TOTAL_BYTES = 500_000
@@ -412,23 +410,36 @@ def parse_surefire(repo: Path) -> dict[str, int]:
 
 
 def declared_capabilities(repo: Path) -> dict[str, bool]:
-    modules = []
-    for pom in inspector.find_poms(repo):
-        module, error = inspector.parse_pom(repo, pom)
-        if module and not error:
-            modules.append(module)
-    return {
-        "jacoco": any(
-            plugin["source"] == "declared"
-            for module in modules
-            for plugin in module["plugins"]["jacoco"]
-        ),
-        "pit": any(
-            plugin["source"] == "declared"
-            for module in modules
-            for plugin in module["plugins"]["pit"]
-        ),
+    found = {"jacoco": False, "pit": False}
+    known = {
+        "jacoco-maven-plugin": "jacoco",
+        "pitest-maven": "pit",
     }
+    for pom in repo.rglob("pom.xml"):
+        parts = pom.relative_to(repo).parts
+        if any(part in {".git", ".opencode", "node_modules", "target"} for part in parts):
+            continue
+        try:
+            root = ET.parse(pom).getroot()
+        except (ET.ParseError, OSError):
+            continue
+        namespace = root.tag.partition("}")[0].removeprefix("{")
+
+        def qname(name: str) -> str:
+            return f"{{{namespace}}}{name}" if namespace else name
+
+        build = root.find(qname("build"))
+        plugins = build.find(qname("plugins")) if build is not None else None
+        if plugins is None:
+            continue
+        for plugin in plugins.findall(qname("plugin")):
+            artifact = plugin.find(qname("artifactId"))
+            if artifact is None or not artifact.text:
+                continue
+            capability = known.get(artifact.text.strip())
+            if capability:
+                found[capability] = True
+    return found
 
 
 def parse_coverage(repo: Path, target_classes: list[str]) -> dict[str, Any] | None:

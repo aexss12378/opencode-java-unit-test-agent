@@ -37,7 +37,7 @@ export default tool({
     const projectRoot = context.worktree || context.directory
     const script = path.join(
       projectRoot,
-      ".opencode/skills/java-unit-testing/scripts/submit_unit_tests.py",
+      ".opencode/tools/submit_unit_tests.py",
     )
     const process = Bun.spawn(
       [
