@@ -1,6 +1,6 @@
 target/
 .DS_Store
-.opencode/test-agent-runs/
+.opencode/unit-test-review/
 .opencode/node_modules/
 .opencode/package-lock.json
 .opencode/bun.lock
