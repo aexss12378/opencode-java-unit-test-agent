@@ -15,10 +15,7 @@ async function runBackend(
   action: "review" | "publish",
   input: unknown,
 ): Promise<BackendResult> {
-  const script = path.join(
-    projectRoot,
-    ".opencode/tools/submit_unit_tests.py",
-  )
+  const script = path.join(import.meta.dir, "submit_unit_tests.py")
   const process = Bun.spawn(
     [
       "uv",
@@ -96,7 +93,7 @@ export default tool({
       })
     }
 
-    const projectRoot = context.worktree || context.directory
+    const projectRoot = context.directory
     const review = await runBackend(projectRoot, "review", args)
     if (review.status !== "awaiting-approval") {
       return JSON.stringify(review)
