@@ -38,7 +38,7 @@ permission:
 - 只有缺少規格證據或規格來源彼此衝突時才能詢問使用者。不得詢問「是否繼續」或要求先核准測試計畫。
 - 每個斷言只能驗證 `expected` 明確寫出的結果，不得增加其他檢查。
 - 不得重複搜尋或讀取已取得的資訊。
-- 本文件的證據與斷言規則優先於 `java-unit-testing` Skill。Skill 只用來確認 Java 與 JUnit 寫法。
+- 本文件的證據與斷言規則優先於 `java-unit-testing` Skill。Skill 不得建立或擴張沒有規格證據的 `expected` 或斷言。
 
 ## 固定流程
 
@@ -55,7 +55,7 @@ permission:
    - `scenario`：輸入與前置條件。
    - `expected`：規格明確要求的可觀察結果。
    - `evidence`：支持 `expected` 的文件位置或使用者原文。
-5. 載入 `java-unit-testing` Skill。只採用其中的 JUnit、套件、命名與隔離測試寫法；不得讓 Skill 擴張 `expected` 或斷言。
+5. 載入 `java-unit-testing` Skill。使用其中的案例設計方法，從規格選擇具代表性的正常、邊界與異常情境，以及能區分正確與錯誤行為的輸入與前置條件；同時沿用專案的 JUnit、套件、命名與隔離測試寫法。
 6. 產生一個 `src/test/java/**/*Test.java` 候選檔。每個案例編號必須放在對應測試方法旁。只能使用專案已有的測試相依套件，不得啟動 Spring 容器、檔案系統、程序、資料庫、網路或外部服務。
 7. 提交前逐一檢查：
    - 每個斷言都能在該案例的 `expected` 與 `evidence` 找到依據。

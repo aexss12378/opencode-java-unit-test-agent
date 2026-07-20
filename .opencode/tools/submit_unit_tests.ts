@@ -18,10 +18,7 @@ async function runBackend(
   const script = path.join(import.meta.dir, "submit_unit_tests.py")
   const process = Bun.spawn(
     [
-      "uv",
-      "run",
-      "--no-project",
-      "python",
+      "python3",
       script,
       action,
       "--repo",
