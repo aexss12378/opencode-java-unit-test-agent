@@ -19,6 +19,7 @@ from typing import Any
 
 MAX_FILE_BYTES = 100_000
 MAVEN_TIMEOUT_SECONDS = 600
+MINIMUM_LINE_COVERAGE_PERCENT = 80
 CASE_ID = re.compile(r"^UT-[0-9]{3,}$")
 PACKAGE = re.compile(
     r"^\s*package\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*;",
@@ -93,7 +94,6 @@ def validate_request(repo: Path) -> dict[str, Any]:
         raise RequestError("測試檔只能位於 src/test/java/**")
     if path.suffix != ".java" or path.stem == "Test" or not path.stem.endswith("Test"):
         raise RequestError("測試檔名必須是受測類別名稱加上 Test.java")
-
     content = raw_file.get("content")
     if not isinstance(content, str) or not content.strip():
         raise RequestError("候選測試內容不得為空")
@@ -118,7 +118,15 @@ def validate_request(repo: Path) -> dict[str, Any]:
         raise RequestError("候選測試與目前檔案相同")
 
     candidate_class = f"{actual_package}.{path.stem}" if actual_package else path.stem
+    target_simple_name = path.stem.removesuffix("Test")
+    target_class = f"{actual_package}.{target_simple_name}" if actual_package else target_simple_name
+    target_relative = PurePosixPath("src", "main", "java", *target_class.split(".")).with_suffix(".java")
+    target_source = destination(repo, target_relative)
+    if target_source.is_symlink() or not target_source.is_file():
+        raise RequestError(f"找不到與候選測試對應的正式類別：{target_class}")
+
     return {
+        "target_class": target_class,
         "test_cases": cases,
         "file": {"path": path.as_posix(), "content": content},
         "candidate_class": candidate_class,
@@ -167,13 +175,13 @@ def copy_project(repo: Path, project: Path) -> None:
     )
 
 
-def run_maven(project: Path) -> dict[str, Any]:
+def run_maven(project: Path, candidate_class: str) -> dict[str, Any]:
     environment = {**os.environ, "CI": "true", "TERM": "dumb", "PWD": str(project)}
     environment.pop("OLDPWD", None)
     environment.pop("INIT_CWD", None)
     try:
         result = subprocess.run(
-            [str(project / "mvnw"), "-B", "-ntp", "test"],
+            [str(project / "mvnw"), "-B", "-ntp", f"-Dtest={candidate_class}", "test"],
             cwd=project,
             check=False,
             capture_output=True,
@@ -190,7 +198,7 @@ def run_maven(project: Path) -> dict[str, Any]:
         stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr or ""
         output, exit_code, timed_out = stdout + stderr, 124, True
     return {
-        "command": "./mvnw -B -ntp test",
+        "command": f"./mvnw -B -ntp -Dtest={candidate_class} test",
         "exit_code": exit_code,
         "timed_out": timed_out,
         "failure_tail": "\n".join(output[-2_000_000:].splitlines()[-80:]),
@@ -200,6 +208,7 @@ def run_maven(project: Path) -> dict[str, Any]:
 def test_summary(project: Path, candidate_class: str) -> dict[str, Any]:
     tests = skipped = 0
     reports: list[str] = []
+    unexpected_classes: set[str] = set()
     for report in sorted((project / "target/surefire-reports").glob("TEST-*.xml")):
         try:
             root = ET.parse(report).getroot()
@@ -211,6 +220,8 @@ def test_summary(project: Path, candidate_class: str) -> dict[str, Any]:
                 continue
             class_name = case.attrib.get("classname", "")
             if class_name != candidate_class and not class_name.startswith(candidate_class + "$"):
+                if class_name:
+                    unexpected_classes.add(class_name)
                 continue
             matched, tests = True, tests + 1
             skipped += any(child.tag.rsplit("}", 1)[-1] == "skipped" for child in case)
@@ -222,6 +233,86 @@ def test_summary(project: Path, candidate_class: str) -> dict[str, Any]:
         "executed": tests - skipped,
         "skipped": skipped,
         "reports": reports,
+        "unexpected_classes": sorted(unexpected_classes),
+    }
+
+
+def coverage_summary(project: Path, target_class: str) -> dict[str, Any]:
+    report = project / "target" / "site" / "jacoco" / "jacoco.xml"
+    if not report.is_file():
+        raise RequestError("Maven test 成功，但找不到 target/site/jacoco/jacoco.xml")
+    try:
+        root = ET.parse(report).getroot()
+    except (ET.ParseError, OSError) as exc:
+        raise RequestError("無法解析 target/site/jacoco/jacoco.xml") from exc
+
+    target_name = target_class.replace(".", "/")
+    target = next(
+        (
+            node
+            for node in root.iter()
+            if node.tag.rsplit("}", 1)[-1] == "class" and node.attrib.get("name") == target_name
+        ),
+        None,
+    )
+    if target is None:
+        raise RequestError(f"JaCoCo XML 找不到受測正式類別：{target_class}")
+
+    counter = next(
+        (
+            node
+            for node in target
+            if node.tag.rsplit("}", 1)[-1] == "counter" and node.attrib.get("type") == "LINE"
+        ),
+        None,
+    )
+    if counter is None:
+        raise RequestError(f"JaCoCo XML 沒有 {target_class} 的 LINE counter")
+    try:
+        missed = int(counter.attrib["missed"])
+        covered = int(counter.attrib["covered"])
+    except (KeyError, ValueError) as exc:
+        raise RequestError(f"JaCoCo XML 的 {target_class} LINE counter 無效") from exc
+
+    total = missed + covered
+    if total == 0:
+        raise RequestError(f"JaCoCo 無法計算 {target_class} 的行覆蓋率")
+
+    package_name = target_name.rpartition("/")[0]
+    source_name = target.attrib.get("sourcefilename")
+    source = next(
+        (
+            child
+            for package in root.iter()
+            if package.tag.rsplit("}", 1)[-1] == "package" and package.attrib.get("name") == package_name
+            for child in package
+            if child.tag.rsplit("}", 1)[-1] == "sourcefile" and child.attrib.get("name") == source_name
+        ),
+        None,
+    )
+    missed_lines: list[int] = []
+    if source is not None:
+        try:
+            missed_lines = sorted(
+                int(line.attrib["nr"])
+                for line in source
+                if line.tag.rsplit("}", 1)[-1] == "line"
+                and int(line.attrib["mi"]) > 0
+                and int(line.attrib["ci"]) == 0
+            )
+        except (KeyError, ValueError) as exc:
+            raise RequestError(f"JaCoCo XML 的 {target_class} 行號資料無效") from exc
+
+    percent = covered * 100 / total
+    return {
+        "target_class": target_class,
+        "counter": "LINE",
+        "covered": covered,
+        "missed": missed,
+        "percent": round(percent, 2),
+        "minimum_percent": MINIMUM_LINE_COVERAGE_PERCENT,
+        "passed": covered * 100 >= MINIMUM_LINE_COVERAGE_PERCENT * total,
+        "missed_lines": missed_lines,
     }
 
 
@@ -238,9 +329,12 @@ def review_files(repo: Path, request: dict[str, Any], validation: dict[str, Any]
         )
     cases = (
         "# 候選單元測試\n\n"
+        f"受測類別：`{request['target_class']}`\n\n"
         f"測試檔：`{request['file']['path']}`\n\n"
         f"驗證指令：`{validation['command']}`\n\n"
         f"實際執行：{validation['candidate_tests']['executed']} 個測試\n\n"
+        f"行覆蓋率：{validation['coverage']['percent']:.2f}%"
+        f"（門檻：{validation['coverage']['minimum_percent']}%）\n\n"
         + "\n\n".join(sections)
         + "\n\n審查資料只能用來查看；需要修改時請拒絕並告訴 Agent 原因。\n"
     )
@@ -269,7 +363,7 @@ def review(repo: Path, request: dict[str, Any]) -> dict[str, Any]:
         project = Path(temporary) / "project"
         copy_project(repo, project)
         write_candidate(project, request["file"])
-        maven = run_maven(project)
+        maven = run_maven(project, request["candidate_class"])
         validation = {key: maven[key] for key in ("command", "exit_code", "timed_out")}
         if maven["exit_code"] != 0:
             return {
@@ -286,6 +380,34 @@ def review(repo: Path, request: dict[str, Any]) -> dict[str, Any]:
             return {
                 "status": "candidate-not-executed",
                 "message": "Maven 成功，但候選測試沒有全部實際執行。",
+                "validation": validation,
+                "published": False,
+            }
+        if summary["unexpected_classes"]:
+            return {
+                "status": "candidate-not-isolated",
+                "message": "Maven 執行了候選類別以外的測試，無法單獨計算候選測試覆蓋率。",
+                "validation": validation,
+                "published": False,
+            }
+
+        try:
+            coverage = coverage_summary(project, request["target_class"])
+        except RequestError as exc:
+            return {
+                "status": "coverage-report-invalid",
+                "message": str(exc),
+                "validation": validation,
+                "published": False,
+            }
+        validation["coverage"] = coverage
+        if not coverage["passed"]:
+            return {
+                "status": "coverage-below-threshold",
+                "message": (
+                    f"候選測試對 {request['target_class']} 的行覆蓋率為 "
+                    f"{coverage['percent']:.2f}%，低於 {coverage['minimum_percent']}% 門檻。"
+                ),
                 "validation": validation,
                 "published": False,
             }

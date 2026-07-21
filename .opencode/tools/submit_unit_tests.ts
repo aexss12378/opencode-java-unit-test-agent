@@ -54,7 +54,7 @@ async function runBackend(
 }
 
 export default tool({
-  description: "提交單一 Java 候選測試。工具先在短暫副本執行 Maven test 並確認候選測試真的有執行，通過後建立 IDE 審查資料並等待人工核准；核准後才寫入 src/test/java/**。",
+  description: "提交單一 Java 候選測試。工具先在短暫副本執行候選測試，確認測試真的有執行且目標類別行覆蓋率至少 80%，通過後建立 IDE 審查資料並等待人工核准；核准後才寫入 src/test/java/**。",
   args: {
     test_cases: tool.schema
       .array(
