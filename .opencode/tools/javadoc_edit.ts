@@ -12,10 +12,6 @@ const javadocText = tool.schema
   .max(50000)
   .describe("Javadoc 內文，不要包含 /**、每行開頭的 * 或結尾 */")
 
-function encode(value: string): string {
-  return Buffer.from(value, "utf8").toString("base64")
-}
-
 async function runBackend(
   projectRoot: string,
   input: {
@@ -23,27 +19,25 @@ async function runBackend(
     additions: Array<{ target_line: number; javadoc: string }>
   },
 ): Promise<BackendResult> {
-  const backend = path.join(import.meta.dir, "JavadocEditBackend.java")
-  const payload = [
-    encode(input.path),
-    String(input.additions.length),
-    ...input.additions.map(
-      (addition) => `${addition.target_line}\t${encode(addition.javadoc)}`,
-    ),
-    "",
-  ].join("\n")
+  const backend = path.join(import.meta.dir, "javadoc_edit_backend.py")
 
   const process = Bun.spawn(
-    ["java", "--source", "17", backend, "--repo", projectRoot],
+    ["uv", "run", "--script", backend, "--repo", projectRoot],
     {
       cwd: projectRoot,
-      env: { ...Bun.env, CI: "true", TERM: "dumb" },
+      env: {
+        ...Bun.env,
+        CI: "true",
+        TERM: "dumb",
+        PYTHONDONTWRITEBYTECODE: "1",
+        UV_NO_PROGRESS: "1",
+      },
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
     },
   )
-  process.stdin.write(payload)
+  process.stdin.write(JSON.stringify(input))
   process.stdin.end()
 
   const [stdout, stderr, exitCode] = await Promise.all([
@@ -68,7 +62,7 @@ async function runBackend(
 
 export default tool({
   description:
-    "只在既有 src/main/java/**/*.java 宣告前新增 Javadoc。從根目錄 pom.xml 讀取 Java 8、17 或 21；每次處理一個檔案。target_line 必須是目前檔案中類別、介面、enum、record、方法、建構子或欄位宣告的第一行（有 annotation 時使用第一個 annotation 的行號）。已有 Javadoc、非宣告位置、其他路徑或任何非 Javadoc 變更都會拒絕。",
+    "只在既有 src/main/java/**/*.java 宣告前新增 Javadoc。每次處理一個檔案；target_line 必須是目前檔案中類別、介面、enum、record、方法、建構子或欄位宣告的第一行（有 annotation 時使用第一個 annotation 的行號）。已有 Javadoc、非宣告位置、其他路徑或無法安全解析的變更都會拒絕。",
   args: {
     path: tool.schema
       .string()
@@ -90,17 +84,7 @@ export default tool({
       .describe("同一 Java 檔案要新增的 Javadoc；所有項目通過才會寫入"),
   },
   async execute(args, context) {
-    if (context.agent !== "javadoc-writer") {
-      return JSON.stringify({
-        status: "blocked",
-        code: "AGENT_NOT_ALLOWED",
-        message: `javadoc_edit 只允許 javadoc-writer 代理使用，目前代理為 ${context.agent}`,
-        retryable: false,
-        written: false,
-      })
-    }
-
-    const result = await runBackend(context.directory, args)
+    const result = await runBackend(context.worktree, args)
     return JSON.stringify(result)
   },
 })

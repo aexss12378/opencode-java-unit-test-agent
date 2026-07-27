@@ -45,8 +45,8 @@ permission:
 5. 每個 Java 檔案只呼叫一次 `javadoc_edit`，將該檔案的新增項目放在同一個 `additions`。
 6. `target_line` 使用呼叫工具前目前檔案的宣告第一行；宣告前有 annotation 時使用第一個 annotation 的行號。
 7. `javadoc` 只提供內文，不包含 `/**`、每行開頭的 `*` 或結尾 `*/`。
-8. 工具拒絕時先查看 `code`、`message` 與 `retryable`：
+8. 工具拒絕時先查看 `message` 與 `retryable`：
    - `retryable: true`：重新讀取該 Java 檔案，只修正工具指出的 Javadoc 內文、已經有 Javadoc 的項目或 `target_line`，然後對該檔案重新提交一次。
-   - `retryable: false`：不得重試，直接回報檔案、行號、錯誤代碼與原因。
+   - `retryable: false`：不得重試，直接回報檔案、行號與原因。
 9. 同一檔案第二次仍被拒絕時停止，不得再提交，也不得改用其他方式寫檔。
 10. 完成後只回報工具確認成功的檔案與新增數量。
