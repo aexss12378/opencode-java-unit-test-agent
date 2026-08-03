@@ -1,6 +1,6 @@
 ---
 name: java-unit-testing
-description: 依 Maven 專案既有的 JUnit、模擬工具與測試風格，為單一 Java 類別撰寫可獨立執行的單元測試候選檔。
+description: 依 Maven 專案既有的 JUnit 與測試風格，為單一 Java 類別設計案例並撰寫可獨立執行的單元測試候選檔。
 ---
 
 # Java 單元測試撰寫
@@ -9,7 +9,6 @@ description: 依 Maven 專案既有的 JUnit、模擬工具與測試風格，為
 
 1. 讀取根目錄 `pom.xml` 與既有測試，確認 JUnit 版本、測試註記、斷言 API、套件及命名方式。
 2. 沿用專案已存在的測試相依套件與風格，不因撰寫候選測試新增建置相依。
-3. 只有專案已經提供 Mockito 或其他模擬工具時才能使用；缺少時回報工程師，不修改 `pom.xml`。
 
 ## 確認測試依據
 
@@ -29,7 +28,7 @@ description: 依 Maven 專案既有的 JUnit、模擬工具與測試風格，為
 
 - 每個測試方法驗證一項可觀察行為，並以專案測試框架的斷言 API 驗證預期結果。
 - 只測一個 Service 或類別；一次只建立或更新一個以 `Test.java` 結尾的測試檔。
-- 不啟動 Spring 測試容器，不讀寫檔案系統、不啟動程序，也不連線到資料庫、網路或外部服務。外部依賴使用專案既有的模擬工具隔離。
+- 不啟動 Spring 測試容器，不讀寫檔案系統、不啟動程序，也不連線到資料庫、網路或外部服務。需要以 Mockito 隔離協作者時，依 `java-mockito-testing` Skill 規則處理。
 - Java 原生 `assert` 是語言功能，不是 JUnit 斷言；JUnit 測試改用 `assertEquals`、`assertTrue`、`assertThrows` 等對應 API。
 - 例外測試只驗證 `expected` 明確要求的內容；只要求例外型別時，不得額外驗證例外訊息。
 - 候選測試的套件宣告、檔案路徑與類別名稱彼此一致。每個案例編號放在對應方法的 `@DisplayName` 或相鄰註解中。

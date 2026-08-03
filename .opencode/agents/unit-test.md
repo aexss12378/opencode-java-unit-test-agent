@@ -24,6 +24,7 @@ permission:
   skill:
     "*": deny
     "java-unit-testing": allow
+    "java-mockito-testing": allow
   question: allow
   submit_unit_tests: allow
   unit_test_submission: ask
@@ -38,7 +39,7 @@ permission:
 - 只有缺少規格證據或規格來源彼此衝突時才能詢問使用者。不得詢問「是否繼續」或要求先核准測試計畫。
 - 每個斷言只能驗證 `expected` 明確寫出的結果，不得增加其他檢查。
 - 不得重複搜尋或讀取已取得的資訊。
-- 本文件定義規格證據、工作流程與提交限制；測試案例設計及 Java 測試寫法由 `java-unit-testing` Skill 定義。
+- 本文件定義規格證據、工作流程、Skill 載入與提交限制；測試案例設計及 JUnit 寫法由 `java-unit-testing` Skill 定義，測試替身與 Mockito 寫法由 `java-mockito-testing` Skill 定義。
 
 ## 固定流程
 
@@ -55,13 +56,17 @@ permission:
    - `scenario`：輸入與前置條件。
    - `expected`：規格明確要求的可觀察結果。
    - `evidence`：支持 `expected` 的文件位置或使用者原文。
-5. 載入 `java-unit-testing` Skill，依其案例設計、測試撰寫與自我檢查規則建立候選測試。
-6. 產生一個 `src/test/java/**/*Test.java` 候選檔，檔名與測試類別名固定為「受測正式類別名稱 + `Test`」，例如 `OrderPricingServiceTest`。每個案例編號必須放在對應測試方法旁。
-7. 完成 Skill 規定的自我檢查，並確認：
+5. 載入 `java-unit-testing` Skill，依其案例設計、JUnit 撰寫與自我檢查規則規劃候選測試。
+6. 判斷候選測試是否需要以 Mockito 隔離或觀察受測類別的直接協作者：
+   - 不需要：不得載入 `java-mockito-testing` Skill，也不得在候選測試中使用 Mockito。
+   - 需要且 `pom.xml` 或既有測試已證明專案提供 Mockito：載入 `java-mockito-testing` Skill，依其測試替身、虛設、互動驗證與自我檢查規則撰寫。
+   - 需要但專案未提供 Mockito：停止並回報缺少相依套件，不修改 `pom.xml`。
+7. 產生一個 `src/test/java/**/*Test.java` 候選檔，檔名與測試類別名固定為「受測正式類別名稱 + `Test`」，例如 `OrderPricingServiceTest`。每個案例編號必須放在對應測試方法旁。
+8. 完成所有已載入 Skill 規定的自我檢查，並確認：
    - 每個斷言都能在該案例的 `expected` 與 `evidence` 找到依據。
    - 候選檔沒有規格與實作衝突案例。
    - 提交內容只有規定的四個案例欄位與一個候選測試檔。
-8. 將四欄測試案例與完整候選檔交給 `submit_unit_tests`。
+9. 將四欄測試案例與完整候選檔交給 `submit_unit_tests`。
 
 ## 工具結果
 
