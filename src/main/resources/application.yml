@@ -1,0 +1,21 @@
+spring:
+  application:
+    name: enterprise-order-platform
+
+server:
+  port: 8080
+
+pricing:
+  standard-discount-percent: 10.00
+  vip-discount-percent: 15.00
+  tax-rate: 0.05
+  free-shipping-threshold: 500.00
+  standard-shipping-fee: 60.00
+  payment-window: PT30M
+
+order-workflow:
+  manual-review-score: 60
+  rejection-score: 85
+  maximum-order-total: 250000.00
+  supported-currency: TWD
+  payment-authorization-window: PT20M

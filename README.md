@@ -1,30 +1,33 @@
-# 舊系統定價範例
+# 企業訂單平台測試專案
 
-這是一個精簡的 Maven 專案，用來驗證專案內的 OpenCode 單元測試 Agent。正式規格位於 `docs/pricing-rules.md`；既有程式與既有測試只能說明目前行為，不能取代正式規格。
+這是一個可直接啟動的 Spring Boot 訂單平台，用來評估單元測試是否能處理企業系統常見的規格密度與協作者互動，而不是只追求測試數量或涵蓋率。
 
-## 單元測試 Agent
+## 業務流程
 
-Agent 一次只處理一個 Service 或類別，並且只能讀取專案、詢問工程師及呼叫 `submit_unit_tests`。它不能直接編輯檔案，也不能修改正式原始碼、`pom.xml`、文件或 `src/test/resources/**`。
+- `POST /api/quotes`：計算折扣、稅額、運費與訂單總額。
+- `POST /api/checkouts`：保留庫存並建立付款期限。
+- `POST /api/order-placements`：執行輸入驗證、冪等檢查、風險分流、庫存保留、付款授權、失敗補償與結果保存。
+- `OrderLifecyclePolicy`：管理訂單從草稿、待付款、確認、出貨到終止狀態的合法轉移。
 
-一次提交包含多個測試案例與一個 `src/test/java/**/*Test.java` 候選檔。每個案例只有 `id`、`scenario`、`expected`、`evidence` 四個欄位；證據不足或規格衝突時，Agent 必須先詢問工程師。
+## 權威規格
 
-`submit_unit_tests` 會完成下列流程：
+- `docs/pricing-rules.md`：折扣計算與取位。
+- `docs/order-placement-rules.md`：訂單放行、冪等、風險、庫存、付款與補償。
+- `docs/order-lifecycle-rules.md`：訂單狀態轉移與付款期限。
+- 公開 API 的 Javadoc：類別或方法特有的可觀察行為。
+- Bean Validation 註記與 `src/main/resources/application.yml`：輸入限制與部署設定值。
 
-1. 在作業系統暫存目錄的專案副本執行 `./mvnw -B -ntp test`。
-2. 確認候選測試出現在 Maven 測試報告中、至少執行一次且沒有被跳過。
-3. 通過後，在 `.opencode/unit-test-review/` 產生 `cases.md`、`changes.diff` 及完整候選測試，並等待人工核准。
-4. 工程師核准後，工具才將同一份候選內容建立或更新至 `src/test/java/**`；拒絕或任何失敗都不發布。
+正式原始碼只用來理解介面與流程。若實作、既有測試與上述權威規格衝突，以權威規格為準。
 
-審查期間不要修改正式測試檔。需要調整候選內容時，請拒絕並在對話中說明原因。此流程不得使用 OpenCode 自動核准模式。
+## 技術條件
 
-候選測試會在人工審查前執行，因此只適用於公司內部可信任的測試產生流程，不是用來執行不受信任 Java 程式碼的安全沙箱。
+- Java 17
+- Spring Boot 3
+- Maven Wrapper
+- JUnit 5、Mockito、AssertJ
 
-## 使用方式
-
-在專案根目錄啟動 OpenCode，確認目前 Agent 為 `unit-test`，然後輸入明確目標，例如：
-
-```text
-請為 OrderPricingService 補上依 docs/pricing-rules.md 設計的單元測試
+```bash
+./mvnw spring-boot:run
 ```
 
-只有工具回傳 `published: true`，才表示測試已寫入正式測試目錄。
+應用程式預設監聽 `8080`，可透過 `server.port` 覆寫。

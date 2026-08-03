@@ -3,8 +3,10 @@ package com.example.legacypricing;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.util.Objects;
+import org.springframework.stereotype.Service;
 
-public final class OrderPricingService {
+@Service
+public final class OrderPricingService implements DiscountCalculator {
 
     private static final BigDecimal ONE_HUNDRED = new BigDecimal("100");
 
@@ -14,6 +16,7 @@ public final class OrderPricingService {
         this.discountPolicy = Objects.requireNonNull(discountPolicy, "discountPolicy");
     }
 
+    @Override
     public BigDecimal calculateDiscount(String customerId, BigDecimal subtotal) {
         if (customerId == null || customerId.isBlank()) {
             throw new IllegalArgumentException("customerId must not be blank");
