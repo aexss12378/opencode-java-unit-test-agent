@@ -1,34 +1,179 @@
-#!/usr/bin/env python3
-"""在隔離副本驗證一個 Java 候選測試，核准後才發布。"""
+"""在無 .git 的短暫副本驗證 Java 候選測試，通過後建立 Draft PR。"""
 
 from __future__ import annotations
 
 import argparse
-import difflib
+import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import urllib.parse
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-
 MAX_FILE_BYTES = 100_000
+MAX_PR_BODY_BYTES = 60_000
 MAVEN_TIMEOUT_SECONDS = 600
+GIT_TIMEOUT_SECONDS = 120
+GITHUB_TIMEOUT_SECONDS = 120
 MINIMUM_LINE_COVERAGE_PERCENT = 80
+BRANCH_PREFIX = "codex/unit-test"
+TRUSTED_BASE_BRANCH = "main"
 CASE_ID = re.compile(r"^UT-[0-9]{3,}$")
+SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,200}$")
 PACKAGE = re.compile(
     r"^\s*package\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*;",
     re.MULTILINE,
 )
+_ACTIVE_PROCESSES: set[subprocess.Popen[str]] = set()
+_ACTIVE_PROCESSES_LOCK = threading.RLock()
+_CANCEL_REQUESTED = False
 
 
 class RequestError(RuntimeError):
     pass
+
+
+class DraftPrVerificationError(RequestError):
+    def __init__(self, message: str, pr_url: str) -> None:
+        super().__init__(message)
+        self.pr_url = pr_url
+
+
+class DraftPrStateUnknownError(RequestError):
+    pass
+
+
+class BranchConflictError(RequestError):
+    pass
+
+
+@dataclass(frozen=True)
+class BaseContext:
+    branch: str
+    head_sha: str
+    remote: str
+    remote_branch: str
+    github_host: str
+    github_repository: str
+
+
+@dataclass(frozen=True)
+class Worktree:
+    root: Path
+    project: Path
+    branch: str
+
+
+def run_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    timeout: int,
+    env: dict[str, str] | None = None,
+    allow_cancelled: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    if _CANCEL_REQUESTED and not allow_cancelled:
+        return subprocess.CompletedProcess(command, 130, "", "工作已取消")
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            start_new_session=True,
+        )
+    except FileNotFoundError as exc:
+        raise RequestError(f"找不到必要指令：{command[0]}") from exc
+    with _ACTIVE_PROCESSES_LOCK:
+        _ACTIVE_PROCESSES.add(process)
+    try:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+            return_code = process.returncode
+        except subprocess.TimeoutExpired:
+            terminate_process(process)
+            stdout, stderr = process.communicate()
+            return_code = 124
+        if _CANCEL_REQUESTED and not allow_cancelled:
+            return_code = 130
+            stderr = (stderr + "\n工作已取消").lstrip("\n")
+        return subprocess.CompletedProcess(command, return_code, stdout, stderr)
+    finally:
+        with _ACTIVE_PROCESSES_LOCK:
+            _ACTIVE_PROCESSES.discard(process)
+
+
+def terminate_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=5)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def request_cancellation(_signum: int, _frame: object | None) -> None:
+    global _CANCEL_REQUESTED
+    _CANCEL_REQUESTED = True
+    with _ACTIVE_PROCESSES_LOCK:
+        active = tuple(_ACTIVE_PROCESSES)
+    for process in active:
+        terminate_process(process)
+
+
+def install_signal_handlers() -> None:
+    signal.signal(signal.SIGTERM, request_cancellation)
+    signal.signal(signal.SIGINT, request_cancellation)
+
+
+def checked_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    timeout: int,
+    message: str,
+) -> str:
+    result = run_command(command, cwd=cwd, timeout=timeout)
+    if result.returncode != 0:
+        detail = (result.stdout + result.stderr).strip()[-4000:]
+        raise RequestError(f"{message}" + (f"：{detail}" if detail else ""))
+    return result.stdout.strip()
+
+
+def git(repo: Path, *arguments: str, message: str = "Git 指令失敗") -> str:
+    return checked_command(
+        ["git", "-C", str(repo), *arguments],
+        cwd=repo,
+        timeout=GIT_TIMEOUT_SECONDS,
+        message=message,
+    )
+
+
+def optional_git(repo: Path, *arguments: str) -> str | None:
+    result = run_command(
+        ["git", "-C", str(repo), *arguments],
+        cwd=repo,
+        timeout=GIT_TIMEOUT_SECONDS,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
 
 
 def repo_root(value: str) -> Path:
@@ -40,7 +185,16 @@ def repo_root(value: str) -> Path:
     wrapper = repo / "mvnw"
     if not wrapper.is_file() or not os.access(wrapper, os.X_OK):
         raise RequestError("專案根目錄需要可執行的 mvnw")
+    top = git(repo, "rev-parse", "--show-toplevel", message="目前目錄不是 Git worktree")
+    if Path(top).resolve() != repo:
+        raise RequestError("--repo 必須指向 Git worktree 根目錄")
     return repo
+
+
+def validate_session_id(value: str) -> str:
+    if not SESSION_ID.fullmatch(value):
+        raise RequestError("OpenCode session ID 格式無效")
+    return value
 
 
 def destination(root: Path, relative: PurePosixPath) -> Path:
@@ -133,25 +287,6 @@ def validate_request(repo: Path) -> dict[str, Any]:
     }
 
 
-def managed(repo: Path, name: str) -> Path:
-    if (repo / ".opencode").is_symlink():
-        raise RequestError(".opencode 不得為符號連結")
-    return repo / ".opencode" / name
-
-
-def reset(path: Path) -> None:
-    if path.is_symlink() or (path.exists() and not path.is_dir()):
-        raise RequestError(f"工具路徑不是一般目錄：{path}")
-    if path.exists():
-        shutil.rmtree(path)
-    path.mkdir(mode=0o700, parents=True)
-
-
-def clean(path: Path) -> None:
-    if path.is_dir() and not path.is_symlink():
-        shutil.rmtree(path, ignore_errors=True)
-
-
 def atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
@@ -166,42 +301,55 @@ def write_candidate(root: Path, file: dict[str, str]) -> None:
     atomic_write(destination(root, PurePosixPath(file["path"])), file["content"])
 
 
-def copy_project(repo: Path, project: Path) -> None:
-    shutil.copytree(
-        repo,
-        project,
-        symlinks=True,
-        ignore=shutil.ignore_patterns(".git", ".opencode", "target"),
-    )
-
-
 def run_maven(project: Path, candidate_class: str) -> dict[str, Any]:
-    environment = {**os.environ, "CI": "true", "TERM": "dumb", "PWD": str(project)}
-    environment.pop("OLDPWD", None)
-    environment.pop("INIT_CWD", None)
-    try:
-        result = subprocess.run(
-            [str(project / "mvnw"), "-B", "-ntp", f"-Dtest={candidate_class}", "test"],
-            cwd=project,
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=environment,
-            timeout=MAVEN_TIMEOUT_SECONDS,
-        )
-        output = result.stdout + result.stderr
-        exit_code, timed_out = result.returncode, False
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout or ""
-        stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr or ""
-        output, exit_code, timed_out = stdout + stderr, 124, True
+    allowed_environment = {
+        "HOME",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "JAVA_HOME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LOGNAME",
+        "MAVEN_ARGS",
+        "MAVEN_OPTS",
+        "MAVEN_USER_HOME",
+        "NO_PROXY",
+        "PATH",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "TMPDIR",
+        "USER",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    }
+    environment = {name: value for name, value in os.environ.items() if name in allowed_environment}
+    environment.update({"CI": "true", "TERM": "dumb", "PWD": str(project)})
+    isolated_config = project.parent / "validation-config"
+    (isolated_config / "gh").mkdir(mode=0o700, parents=True, exist_ok=True)
+    environment.update(
+        {
+            "GH_CONFIG_DIR": str(isolated_config / "gh"),
+            "GH_PROMPT_DISABLED": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    result = run_command(
+        [str(project / "mvnw"), "-B", "-ntp", f"-Dtest={candidate_class}", "test"],
+        cwd=project,
+        timeout=MAVEN_TIMEOUT_SECONDS,
+        env=environment,
+    )
+    output_lines = result.stdout.splitlines() + result.stderr.splitlines()
+    exit_code, timed_out = result.returncode, result.returncode == 124
     return {
         "command": f"./mvnw -B -ntp -Dtest={candidate_class} test",
         "exit_code": exit_code,
         "timed_out": timed_out,
-        "failure_tail": "\n".join(output[-2_000_000:].splitlines()[-80:]),
+        "maven_errors": "\n".join(line for line in output_lines if "[ERROR]" in line),
     }
 
 
@@ -316,153 +464,747 @@ def coverage_summary(project: Path, target_class: str) -> dict[str, Any]:
     }
 
 
-def review_files(repo: Path, request: dict[str, Any], validation: dict[str, Any]) -> Path:
-    review = managed(repo, "unit-test-review")
-    reset(review)
-    sections = []
-    for case in request["test_cases"]:
-        sections.append(
-            f"## {case['id']}\n\n"
-            f"- 情境：{case['scenario']}\n"
-            f"- 預期：{case['expected']}\n"
-            f"- 依據：{case['evidence']}"
-        )
-    cases = (
-        "# 候選單元測試\n\n"
-        f"受測類別：`{request['target_class']}`\n\n"
-        f"測試檔：`{request['file']['path']}`\n\n"
-        f"驗證指令：`{validation['command']}`\n\n"
-        f"實際執行：{validation['candidate_tests']['executed']} 個測試\n\n"
-        f"行覆蓋率：{validation['coverage']['percent']:.2f}%"
-        f"（門檻：{validation['coverage']['minimum_percent']}%）\n\n"
-        + "\n\n".join(sections)
-        + "\n\n審查資料只能用來查看；需要修改時請拒絕並告訴 Agent 原因。\n"
-    )
-    atomic_write(review / "cases.md", cases)
-
-    relative = PurePosixPath(request["file"]["path"])
-    current = destination(repo, relative)
-    old = current.read_text(encoding="utf-8") if current.is_file() else ""
-    diff = "".join(
-        difflib.unified_diff(
-            old.splitlines(keepends=True),
-            request["file"]["content"].splitlines(keepends=True),
-            fromfile=f"a/{relative}" if current.is_file() else "/dev/null",
-            tofile=f"b/{relative}",
-        )
-    )
-    atomic_write(review / "changes.diff", diff)
-    write_candidate(review, request["file"])
-    return review
+def github_remote(value: str) -> tuple[str, str]:
+    if "://" not in value and re.fullmatch(r"[^@\s]+@[^:\s]+:.+", value):
+        user_host, raw_path = value.split(":", 1)
+        host = user_host.rsplit("@", 1)[-1]
+        path = raw_path
+    else:
+        parsed = urllib.parse.urlparse(value)
+        host = parsed.hostname or ""
+        path = parsed.path
+    repository = urllib.parse.unquote(path).strip("/").removesuffix(".git")
+    if not host or not re.fullmatch(r"[^/\s]+/[^/\s]+", repository):
+        raise RequestError("Git push remote 不是可辨識的 GitHub repository URL")
+    return host.lower(), repository
 
 
-def review(repo: Path, request: dict[str, Any]) -> dict[str, Any]:
-    review_dir = managed(repo, "unit-test-review")
-    clean(review_dir)
-    with tempfile.TemporaryDirectory(prefix="unit-test-work-") as temporary:
-        project = Path(temporary) / "project"
-        copy_project(repo, project)
-        write_candidate(project, request["file"])
-        maven = run_maven(project, request["candidate_class"])
-        validation = {key: maven[key] for key in ("command", "exit_code", "timed_out")}
-        if maven["exit_code"] != 0:
-            return {
-                "status": "candidate-check-failed",
-                "message": (
-                    "候選測試未通過 Maven test；請依規格證據判斷是候選測試錯誤"
-                    "或可能的正式原始碼缺陷。不得自動修改 expected；確認為規格與實作"
-                    "衝突時，標記該案例並繼續處理其他案例。"
-                ),
-                "validation": validation,
-                "failure_tail": maven["failure_tail"],
-                "published": False,
-            }
-
-        summary = test_summary(project, request["candidate_class"])
-        validation["candidate_tests"] = summary
-        if summary["tests"] == 0 or summary["skipped"]:
-            return {
-                "status": "candidate-not-executed",
-                "message": "Maven 成功，但候選測試沒有全部實際執行。",
-                "validation": validation,
-                "published": False,
-            }
-        if summary["unexpected_classes"]:
-            return {
-                "status": "candidate-not-isolated",
-                "message": "Maven 執行了候選類別以外的測試，無法單獨計算候選測試覆蓋率。",
-                "validation": validation,
-                "published": False,
-            }
-
-        try:
-            coverage = coverage_summary(project, request["target_class"])
-        except RequestError as exc:
-            return {
-                "status": "coverage-report-invalid",
-                "message": str(exc),
-                "validation": validation,
-                "published": False,
-            }
-        validation["coverage"] = coverage
-        if not coverage["passed"]:
-            return {
-                "status": "coverage-below-threshold",
-                "message": (
-                    f"候選測試對 {request['target_class']} 的行覆蓋率為 "
-                    f"{coverage['percent']:.2f}%，低於 {coverage['minimum_percent']}% 門檻。"
-                ),
-                "validation": validation,
-                "published": False,
-            }
-
-        review_dir = review_files(repo, request, validation)
-        candidate = destination(review_dir, PurePosixPath(request["file"]["path"]))
-        return {
-            "status": "awaiting-approval",
-            "message": "候選測試已通過 Maven test，請在 IDE 審查後核准或拒絕。",
-            "review_directory": str(review_dir),
-            "review_files": [
-                str(review_dir / "cases.md"),
-                str(review_dir / "changes.diff"),
-                str(candidate),
-            ],
-            "validation": validation,
-            "published": False,
-        }
+def command_failure(result: subprocess.CompletedProcess[str], message: str) -> RequestError:
+    detail = (result.stdout + result.stderr).strip()[-4000:]
+    return RequestError(message + (f"：{detail}" if detail else ""))
 
 
-def publish(repo: Path, request: dict[str, Any]) -> dict[str, Any]:
-    relative = PurePosixPath(request["file"]["path"])
-    target = destination(repo, relative)
-    change = "updated" if target.is_file() else "created"
-    atomic_write(target, request["file"]["content"])
-    clean(managed(repo, "unit-test-review"))
+def github_environment() -> dict[str, str]:
     return {
-        "status": "published",
-        "message": "已發布工程師核准且通過 Maven test 的候選單元測試。",
-        "published": True,
-        "published_file": relative.as_posix(),
-        "change": change,
+        **os.environ,
+        "GH_PROMPT_DISABLED": "1",
+        "GH_PAGER": "cat",
+        "NO_COLOR": "1",
     }
 
 
+def remote_sha(repo: Path, remote: str, branch: str) -> str | None:
+    result = run_command(
+        ["git", "-C", str(repo), "ls-remote", "--exit-code", remote, f"refs/heads/{branch}"],
+        cwd=repo,
+        timeout=GIT_TIMEOUT_SECONDS,
+    )
+    if result.returncode == 2:
+        return None
+    if result.returncode != 0:
+        raise command_failure(result, f"無法查詢遠端分支 {remote}/{branch}")
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise RequestError(f"遠端分支 {remote}/{branch} 回傳非預期結果")
+    sha, separator, reference = lines[0].partition("\t")
+    if separator != "\t" or reference != f"refs/heads/{branch}" or not re.fullmatch(r"[0-9a-fA-F]{40,64}", sha):
+        raise RequestError(f"遠端分支 {remote}/{branch} 的 SHA 格式無效")
+    return sha.lower()
+
+
+def require_remote_sha(repo: Path, remote: str, branch: str, expected: str, stage: str) -> None:
+    actual = remote_sha(repo, remote, branch)
+    if actual != expected:
+        raise RequestError(
+            f"{stage}的遠端 {remote}/{branch} 已移動：預期 {expected}，實際 {actual or '(不存在)'}"
+        )
+
+
+def base_context(repo: Path) -> BaseContext:
+    status = git(repo, "status", "--porcelain=v1", "--untracked-files=all")
+    if status:
+        preview = "；".join(status.splitlines()[:5])
+        raise RequestError(f"建立子代理分支前，基準 worktree 必須沒有未提交變更：{preview}")
+
+    branch = optional_git(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
+    if not branch:
+        raise RequestError("基準 worktree 不得處於 detached HEAD")
+    if branch != TRUSTED_BASE_BRANCH:
+        raise RequestError(f"必須從受信任基準分支 {TRUSTED_BASE_BRANCH} 啟動，目前分支為 {branch}")
+    head_sha = git(repo, "rev-parse", "HEAD").lower()
+    remote = optional_git(repo, "config", "--get", f"branch.{branch}.remote")
+    merge_ref = optional_git(repo, "config", "--get", f"branch.{branch}.merge")
+    if not remote or remote == "." or not merge_ref or not merge_ref.startswith("refs/heads/"):
+        raise RequestError(f"目前分支 {branch} 必須追蹤 GitHub 遠端分支")
+    remote_branch = merge_ref.removeprefix("refs/heads/")
+    if remote_branch != TRUSTED_BASE_BRANCH:
+        raise RequestError(
+            f"基準分支 {branch} 必須追蹤遠端 {TRUSTED_BASE_BRANCH}，目前追蹤 {remote_branch}"
+        )
+    upstream_sha = git(repo, "rev-parse", "@{upstream}").lower()
+    if head_sha != upstream_sha:
+        raise RequestError(f"目前 HEAD 與本機追蹤分支 {remote}/{remote_branch} 不一致")
+
+    remote_url = git(repo, "remote", "get-url", "--push", remote)
+    host, repository = github_remote(remote_url)
+    require_remote_sha(repo, remote, remote_branch, head_sha, "建立工作前")
+
+    if shutil.which("gh") is None:
+        raise RequestError("找不到 GitHub CLI gh，無法建立 Draft PR")
+    auth = run_command(
+        ["gh", "auth", "status", "--hostname", host],
+        cwd=repo,
+        timeout=GITHUB_TIMEOUT_SECONDS,
+        env=github_environment(),
+    )
+    if auth.returncode != 0:
+        raise command_failure(auth, f"GitHub CLI 尚未登入 {host}")
+    return BaseContext(branch, head_sha, remote, remote_branch, host, repository)
+
+
+def branch_name(session_id: str, request: dict[str, Any]) -> str:
+    simple_name = request["target_class"].rsplit(".", 1)[-1]
+    slug = re.sub(r"[^a-z0-9]+", "-", simple_name.lower()).strip("-") or "java-test"
+    digest_input = "\0".join(
+        (session_id, request["target_class"], request["file"]["path"], request["file"]["content"])
+    )
+    digest = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()[:12]
+    return f"{BRANCH_PREFIX}/{slug[:48]}-{digest}"
+
+
+def ensure_branch_available(repo: Path, base: BaseContext, branch: str) -> None:
+    local = run_command(
+        ["git", "-C", str(repo), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=repo,
+        timeout=GIT_TIMEOUT_SECONDS,
+    )
+    if local.returncode == 0:
+        raise BranchConflictError(f"本機分支已存在，需要人工確認先前提交結果：{branch}")
+    if local.returncode != 1:
+        raise command_failure(local, f"無法檢查本機分支 {branch}")
+    if remote_sha(repo, base.remote, branch) is not None:
+        raise BranchConflictError(f"遠端分支已存在，需要人工確認先前提交或 PR：{base.remote}/{branch}")
+
+
+def create_worktree(repo: Path, base: BaseContext, branch: str) -> Worktree:
+    ensure_branch_available(repo, base, branch)
+    root = Path(tempfile.mkdtemp(prefix="opencode-unit-test-"))
+    project = root / "repo"
+    result = run_command(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            branch,
+            str(project),
+            base.head_sha,
+        ],
+        cwd=repo,
+        timeout=GIT_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        shutil.rmtree(root, ignore_errors=True)
+        run_command(
+            ["git", "-C", str(repo), "branch", "-D", "--", branch],
+            cwd=repo,
+            timeout=GIT_TIMEOUT_SECONDS,
+            allow_cancelled=True,
+        )
+        raise command_failure(result, f"無法建立測試 worktree {branch}")
+    return Worktree(root, project, branch)
+
+
+def create_validation_copy(source: Path, project: Path) -> None:
+    source_root = source.resolve()
+
+    def ignored(path: str, names: list[str]) -> set[str]:
+        result = {name for name in names if name in {".git", ".opencode"}}
+        if Path(path).resolve() == source_root and "target" in names:
+            result.add("target")
+        return result
+
+    shutil.copytree(
+        source,
+        project,
+        symlinks=True,
+        ignore=ignored,
+    )
+    if (project / ".git").exists():
+        raise RequestError("Maven 驗證副本不得包含 .git")
+
+
+def git_nul_paths(repo: Path, *arguments: str) -> set[str]:
+    result = run_command(
+        ["git", "-C", str(repo), *arguments],
+        cwd=repo,
+        timeout=GIT_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        raise command_failure(result, "無法檢查 Git 變更清單")
+    return {value for value in result.stdout.split("\0") if value}
+
+
+def changed_paths(repo: Path) -> set[str]:
+    return (
+        git_nul_paths(repo, "diff", "--name-only", "-z", "--")
+        | git_nul_paths(repo, "diff", "--cached", "--name-only", "-z", "--")
+        | git_nul_paths(repo, "ls-files", "--others", "--exclude-standard", "-z")
+    )
+
+
+def require_only_path(actual: set[str], expected: str, stage: str) -> None:
+    if actual != {expected}:
+        shown = ", ".join(sorted(actual)) if actual else "(沒有變更)"
+        raise RequestError(f"{stage} 的 Git 變更不只包含 {expected}：{shown}")
+
+
+def validation_failure(
+    status: str,
+    message: str,
+    validation: dict[str, Any],
+    **extra: Any,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "message": message,
+        "submitted": False,
+        "pr_created": False,
+        "merged": False,
+        "validation": validation,
+        **extra,
+    }
+
+
+def validate_candidate(project: Path, request: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    expected_path = request["file"]["path"]
+    write_candidate(project, request["file"])
+
+    maven = run_maven(project, request["candidate_class"])
+    validation = {key: maven[key] for key in ("command", "exit_code", "timed_out")}
+    if maven["exit_code"] == 130 and _CANCEL_REQUESTED:
+        return None, validation_failure(
+            "cancelled",
+            "單元測試工作已取消；沒有推送分支或建立 PR。",
+            validation,
+        )
+    if maven["exit_code"] != 0:
+        return None, validation_failure(
+            "candidate-check-failed",
+            (
+                "候選測試未通過本機 Maven test；請依規格證據判斷是候選測試錯誤，"
+                "或可能的正式原始碼缺陷。不得為了讓測試通過而改寫有證據支持的預期結果。"
+            ),
+            validation,
+            diagnostic_field="maven_errors",
+            agent_action="若為候選測試的編譯、匯入或設定錯誤，修正候選內容後重新提交。",
+            maven_errors=maven["maven_errors"],
+        )
+
+    summary = test_summary(project, request["candidate_class"])
+    validation["candidate_tests"] = summary
+    if summary["tests"] == 0 or summary["skipped"]:
+        return None, validation_failure(
+            "candidate-not-executed",
+            "Maven 成功，但候選測試沒有全部實際執行。",
+            validation,
+        )
+    if summary["unexpected_classes"]:
+        return None, validation_failure(
+            "candidate-not-isolated",
+            "Maven 執行了候選類別以外的測試，無法單獨計算候選測試覆蓋率。",
+            validation,
+        )
+
+    try:
+        coverage = coverage_summary(project, request["target_class"])
+    except RequestError as exc:
+        return None, validation_failure("coverage-report-invalid", str(exc), validation)
+    validation["coverage"] = coverage
+    if not coverage["passed"]:
+        return None, validation_failure(
+            "coverage-below-threshold",
+            (
+                f"候選測試對 {request['target_class']} 的行覆蓋率為 {coverage['percent']:.2f}%，"
+                f"低於 {coverage['minimum_percent']}% 門檻。"
+            ),
+            validation,
+        )
+
+    if destination(project, PurePosixPath(expected_path)).read_text(encoding="utf-8") != request["file"]["content"]:
+        raise RequestError("Maven 驗證後的候選測試內容與提交內容不一致")
+    return validation, None
+
+
+def commit_candidate(project: Path, base: BaseContext, request: dict[str, Any]) -> tuple[str, str]:
+    path = request["file"]["path"]
+    content = request["file"]["content"]
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    git(project, "add", "--", path, message="無法暫存候選測試")
+    require_only_path(
+        git_nul_paths(project, "diff", "--cached", "--name-only", "-z", "--"),
+        path,
+        "建立提交前",
+    )
+    if git_nul_paths(project, "diff", "--name-only", "-z", "--") or git_nul_paths(
+        project, "ls-files", "--others", "--exclude-standard", "-z"
+    ):
+        raise RequestError("建立提交前仍有未暫存或未追蹤的額外變更")
+    git(project, "diff", "--cached", "--check", "--", message="候選測試未通過 git diff --check")
+
+    title = f"新增 {request['target_class']} 單元測試"
+    git(
+        project,
+        "-c",
+        "commit.gpgSign=false",
+        "commit",
+        "--quiet",
+        "-m",
+        title,
+        "-m",
+        f"Candidate-SHA256: {digest}",
+        message="無法建立候選測試提交",
+    )
+    head_sha = git(project, "rev-parse", "HEAD").lower()
+    if git(project, "rev-parse", "HEAD^").lower() != base.head_sha:
+        raise RequestError("候選測試提交的父提交不是已驗證的 base SHA")
+    require_only_path(
+        git_nul_paths(project, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "HEAD"),
+        path,
+        "候選測試提交",
+    )
+    shown = run_command(
+        ["git", "-C", str(project), "show", f"{head_sha}:{path}"],
+        cwd=project,
+        timeout=GIT_TIMEOUT_SECONDS,
+    )
+    if shown.returncode != 0:
+        raise command_failure(shown, "無法讀取候選測試提交內容")
+    if hashlib.sha256(shown.stdout.encode("utf-8")).hexdigest() != digest:
+        raise RequestError("候選測試提交內容的 SHA-256 與本機驗證內容不一致")
+    if changed_paths(project):
+        raise RequestError("建立提交後 worktree 仍有額外變更")
+    return head_sha, digest
+
+
+def push_branch(project: Path, base: BaseContext, branch: str) -> None:
+    result = run_command(
+        [
+            "git",
+            "-C",
+            str(project),
+            "push",
+            "--porcelain",
+            base.remote,
+            f"HEAD:refs/heads/{branch}",
+        ],
+        cwd=project,
+        timeout=GIT_TIMEOUT_SECONDS,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+    )
+    if result.returncode != 0:
+        raise command_failure(result, f"無法推送分支 {branch}")
+
+
+def github_locator(base: BaseContext) -> str:
+    return base.github_repository if base.github_host == "github.com" else f"{base.github_host}/{base.github_repository}"
+
+
+def pr_body(
+    request: dict[str, Any],
+    validation: dict[str, Any],
+    base: BaseContext,
+    branch: str,
+    head_sha: str,
+    candidate_digest: str,
+) -> str:
+    cases = []
+    for case in request["test_cases"]:
+        cases.append(
+            f"### {case['id']}\n\n"
+            f"- 情境：{case['scenario']}\n"
+            f"- 預期：{case['expected']}\n"
+            f"- 規格依據：{case['evidence']}"
+        )
+    body = (
+        "## 單元測試候選\n\n"
+        f"- 受測類別：`{request['target_class']}`\n"
+        f"- 測試檔：`{request['file']['path']}`\n"
+        f"- 基準：`{base.remote_branch}` (`{base.head_sha}`)\n"
+        f"- 分支：`{branch}`\n"
+        f"- 提交：`{head_sha}`\n"
+        f"- 候選內容 SHA-256：`{candidate_digest}`\n\n"
+        "## 本機驗證\n\n"
+        f"- 指令：`{validation['command']}`\n"
+        f"- 實際執行測試：{validation['candidate_tests']['executed']}\n"
+        f"- 目標類別行覆蓋率：{validation['coverage']['percent']:.2f}%"
+        f"（門檻 {validation['coverage']['minimum_percent']}%）\n\n"
+        "## 測試案例與依據\n\n"
+        + "\n\n".join(cases)
+        + "\n\n---\n\n"
+        "此 PR 必須由工程師審查。自動化工具不會將它轉為 Ready，也不會合併。\n"
+    )
+    if len(body.encode("utf-8")) > MAX_PR_BODY_BYTES:
+        raise RequestError(f"Draft PR 內容超過 {MAX_PR_BODY_BYTES} bytes，請縮短案例描述或規格依據")
+    return body
+
+
+def create_draft_pr(
+    project: Path,
+    request: dict[str, Any],
+    validation: dict[str, Any],
+    base: BaseContext,
+    branch: str,
+    head_sha: str,
+    candidate_digest: str,
+) -> dict[str, Any]:
+    body = pr_body(request, validation, base, branch, head_sha, candidate_digest)
+    locator = github_locator(base)
+    title = f"test: 新增 {request['target_class']} 單元測試"
+    with tempfile.TemporaryDirectory(prefix="opencode-unit-test-pr-") as temporary:
+        body_file = Path(temporary) / "body.md"
+        atomic_write(body_file, body)
+        created = run_command(
+            [
+                "gh",
+                "pr",
+                "create",
+                "--draft",
+                "--repo",
+                locator,
+                "--base",
+                base.remote_branch,
+                "--head",
+                branch,
+                "--title",
+                title,
+                "--body-file",
+                str(body_file),
+            ],
+            cwd=project,
+            timeout=GITHUB_TIMEOUT_SECONDS,
+            env=github_environment(),
+        )
+    if created.returncode != 0:
+        failure = command_failure(created, f"分支已推送，但 gh 未能確認 Draft PR 結果：{branch}")
+        raise DraftPrStateUnknownError(str(failure))
+    urls = re.findall(r"https?://[^\s]+", created.stdout)
+    if not urls:
+        raise DraftPrStateUnknownError("gh pr create 結束，但沒有回傳可驗證的 PR URL")
+    url = urls[-1].rstrip(".,)")
+
+    viewed = run_command(
+        [
+            "gh",
+            "pr",
+            "view",
+            url,
+            "--repo",
+            locator,
+            "--json",
+            "number,url,isDraft,state,headRefName,headRefOid,baseRefName",
+        ],
+        cwd=project,
+        timeout=GITHUB_TIMEOUT_SECONDS,
+        env=github_environment(),
+    )
+    if viewed.returncode != 0:
+        failure = command_failure(viewed, "Draft PR 已建立，但無法重新查詢驗證")
+        raise DraftPrVerificationError(str(failure), url)
+    try:
+        details = json.loads(viewed.stdout)
+    except json.JSONDecodeError as exc:
+        raise DraftPrVerificationError("gh pr view 沒有回傳有效 JSON", url) from exc
+    expected = {
+        "url": url,
+        "isDraft": True,
+        "state": "OPEN",
+        "headRefName": branch,
+        "headRefOid": head_sha,
+        "baseRefName": base.remote_branch,
+    }
+    mismatches = [key for key, value in expected.items() if details.get(key) != value]
+    if mismatches:
+        raise DraftPrVerificationError("Draft PR 驗證失敗：" + ", ".join(mismatches), url)
+    return details
+
+
+def compare_url(base: BaseContext, branch: str) -> str:
+    old = urllib.parse.quote(base.remote_branch, safe="")
+    new = urllib.parse.quote(branch, safe="")
+    return f"https://{base.github_host}/{base.github_repository}/compare/{old}...{new}?expand=1"
+
+
+def cleanup_worktree(repo: Path, worktree: Worktree | None, delete_branch: bool) -> list[str]:
+    if worktree is None:
+        return []
+    warnings: list[str] = []
+    removed = run_command(
+        ["git", "-C", str(repo), "worktree", "remove", "--force", str(worktree.project)],
+        cwd=repo,
+        timeout=GIT_TIMEOUT_SECONDS,
+        allow_cancelled=True,
+    )
+    if removed.returncode != 0:
+        warnings.append(
+            f"Git 無法移除暫存 worktree；為避免留下失效的 Git 登錄，已保留於 {worktree.project}，"
+            "需要人工執行 git worktree remove --force <path>"
+        )
+        return warnings
+    shutil.rmtree(worktree.root, ignore_errors=True)
+    if delete_branch:
+        deleted = run_command(
+            ["git", "-C", str(repo), "branch", "-D", "--", worktree.branch],
+            cwd=repo,
+            timeout=GIT_TIMEOUT_SECONDS,
+            allow_cancelled=True,
+        )
+        if deleted.returncode != 0:
+            warnings.append(f"無法刪除工具建立的本機分支 {worktree.branch}")
+    return warnings
+
+
+def submit(repo: Path, session_id: str, request: dict[str, Any]) -> dict[str, Any]:
+    try:
+        base = base_context(repo)
+    except RequestError as exc:
+        return {
+            "status": "cancelled" if _CANCEL_REQUESTED else "preflight-failed",
+            "message": str(exc),
+            "submitted": False,
+            "pr_created": False,
+            "merged": False,
+        }
+
+    branch = branch_name(session_id, request)
+    worktree: Worktree | None = None
+    committed = False
+    pushed = False
+    head_sha: str | None = None
+    validation: dict[str, Any] | None = None
+    result: dict[str, Any]
+    try:
+        worktree = create_worktree(repo, base, branch)
+        with tempfile.TemporaryDirectory(prefix="opencode-unit-test-validation-") as temporary:
+            validation_project = Path(temporary) / "project"
+            create_validation_copy(worktree.project, validation_project)
+            validation, failure = validate_candidate(validation_project, request)
+        if failure is not None:
+            result = {**failure, "branch": branch, "base_sha": base.head_sha}
+        else:
+            assert validation is not None
+            write_candidate(worktree.project, request["file"])
+            require_only_path(
+                changed_paths(worktree.project),
+                request["file"]["path"],
+                "寫入已驗證候選測試後",
+            )
+            require_remote_sha(
+                worktree.project,
+                base.remote,
+                base.remote_branch,
+                base.head_sha,
+                "Maven 驗證後",
+            )
+            head_sha, digest = commit_candidate(worktree.project, base, request)
+            committed = True
+            pr_body(request, validation, base, branch, head_sha, digest)
+            try:
+                push_branch(worktree.project, base, branch)
+            except RequestError as exc:
+                if _CANCEL_REQUESTED:
+                    result = {
+                        "status": "cancelled",
+                        "message": "工作在推送期間取消；遠端分支狀態尚未確認。",
+                        "submitted": None,
+                        "remote_state": "unknown",
+                        "pr_created": False,
+                        "merged": False,
+                        "manual_recovery_required": True,
+                        "automatic_retry_supported": False,
+                        "branch": branch,
+                        "base_sha": base.head_sha,
+                        "commit_sha": head_sha,
+                        "validation": validation,
+                    }
+                else:
+                    observed_remote_sha: str | None = None
+                    remote_state = "unknown-after-push-attempt"
+                    try:
+                        observed_remote_sha = remote_sha(worktree.project, base.remote, branch)
+                        remote_state = "verified-after-push-attempt"
+                    except RequestError:
+                        pass
+                    result = {
+                        "status": "push-failed",
+                        "message": str(exc),
+                        "submitted": (
+                            observed_remote_sha == head_sha if remote_state == "verified-after-push-attempt" else None
+                        ),
+                        "remote_sha": observed_remote_sha,
+                        "remote_state": remote_state,
+                        "pr_created": False,
+                        "merged": False,
+                        "manual_recovery_required": True,
+                        "automatic_retry_supported": False,
+                        "branch": branch,
+                        "base_sha": base.head_sha,
+                        "commit_sha": head_sha,
+                        "validation": validation,
+                    }
+                    if observed_remote_sha == head_sha:
+                        result["compare_url"] = compare_url(base, branch)
+            else:
+                pushed = True
+                live_sha = remote_sha(worktree.project, base.remote, branch)
+                if live_sha != head_sha:
+                    raise RequestError(
+                        f"推送後遠端分支 SHA 不一致：預期 {head_sha}，實際 {live_sha or '(不存在)'}"
+                    )
+                require_remote_sha(
+                    worktree.project,
+                    base.remote,
+                    base.remote_branch,
+                    base.head_sha,
+                    "建立 PR 前",
+                )
+                pr: dict[str, Any] | None = None
+                verified_sha: str | None = None
+                try:
+                    pr = create_draft_pr(
+                        worktree.project,
+                        request,
+                        validation,
+                        base,
+                        branch,
+                        head_sha,
+                        digest,
+                    )
+                    verified_sha = remote_sha(worktree.project, base.remote, branch)
+                    if verified_sha != head_sha:
+                        raise RequestError(
+                            f"PR 建立後遠端分支 SHA 不一致：預期 {head_sha}，實際 {verified_sha or '(不存在)'}"
+                        )
+                    require_remote_sha(
+                        worktree.project,
+                        base.remote,
+                        base.remote_branch,
+                        base.head_sha,
+                        "PR 建立後",
+                    )
+                except RequestError as exc:
+                    pr_url = pr["url"] if pr is not None else getattr(exc, "pr_url", None)
+                    cancelled = _CANCEL_REQUESTED
+                    pr_state_unknown = cancelled or isinstance(exc, DraftPrStateUnknownError)
+                    result = {
+                        "status": "cancelled" if cancelled else "pr-create-or-verify-failed",
+                        "message": (
+                            "工作在建立或驗證 PR 期間取消；PR 狀態尚未確認。" if cancelled else str(exc)
+                        ),
+                        "submitted": True,
+                        "pr_created": None if pr_state_unknown and pr_url is None else pr_url is not None,
+                        "pr_verified": False,
+                        "merged": False,
+                        "manual_recovery_required": True,
+                        "automatic_retry_supported": False,
+                        "branch": branch,
+                        "base_sha": base.head_sha,
+                        "commit_sha": head_sha,
+                        "remote_sha": verified_sha,
+                        "compare_url": compare_url(base, branch),
+                        "validation": validation,
+                    }
+                    if verified_sha is None:
+                        result["remote_state"] = "unknown-after-pr-attempt"
+                    if pr_state_unknown and pr_url is None:
+                        result["pr_state"] = "unknown"
+                    if pr_url is not None:
+                        result["pr_url"] = pr_url
+                else:
+                    result = {
+                        "status": "draft-pr-created",
+                        "message": "候選測試已通過本機 Maven 驗證，並建立等待人工審查的 Draft PR。",
+                        "submitted": True,
+                        "pr_created": True,
+                        "pr_verified": True,
+                        "merged": False,
+                        "target_class": request["target_class"],
+                        "test_file": request["file"]["path"],
+                        "base_branch": base.remote_branch,
+                        "base_sha": base.head_sha,
+                        "branch": branch,
+                        "commit_sha": head_sha,
+                        "remote_sha": verified_sha,
+                        "pr": {
+                            "number": pr["number"],
+                            "url": pr["url"],
+                            "draft": pr["isDraft"],
+                        },
+                        "validation": validation,
+                    }
+    except (RequestError, OSError, UnicodeError) as exc:
+        branch_conflict = isinstance(exc, BranchConflictError)
+        result = {
+            "status": (
+                "cancelled" if _CANCEL_REQUESTED else "branch-conflict" if branch_conflict else "submission-failed"
+            ),
+            "message": str(exc),
+            "submitted": pushed,
+            "pr_created": False,
+            "merged": False,
+            "branch": branch,
+            "base_sha": base.head_sha,
+            "manual_recovery_required": committed or branch_conflict,
+            "automatic_retry_supported": not (committed or branch_conflict),
+        }
+        if head_sha is not None:
+            result["commit_sha"] = head_sha
+        if validation is not None:
+            result["validation"] = validation
+        if pushed:
+            result["compare_url"] = compare_url(base, branch)
+    warnings = cleanup_worktree(repo, worktree, delete_branch=not (committed and not pushed))
+    if warnings:
+        result["cleanup_warnings"] = warnings
+    return result
+
+
 def main() -> int:
+    install_signal_handlers()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("review", "publish"))
+    parser.add_argument("action", choices=("submit",))
     parser.add_argument("--repo", default=".")
+    parser.add_argument("--session-id", required=True)
     args = parser.parse_args()
     try:
         repo = repo_root(args.repo)
+        session_id = validate_session_id(args.session_id)
         request = validate_request(repo)
-        result = review(repo, request) if args.action == "review" else publish(repo, request)
+        result = submit(repo, session_id, request)
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0 if result["status"] in {"awaiting-approval", "published"} else 3
+        return 0 if result["status"] == "draft-pr-created" else 3
     except (RequestError, OSError, UnicodeError) as exc:
-        print(json.dumps({"status": "invalid-request", "message": str(exc), "published": False}, ensure_ascii=False, indent=2))
+        result = {
+            "status": "invalid-request",
+            "message": str(exc),
+            "submitted": False,
+            "pr_created": False,
+            "merged": False,
+        }
+        print(json.dumps(result, ensure_ascii=False, indent=2))
         return 2
-    except Exception as exc:
-        print(json.dumps({"status": "internal-error", "message": str(exc), "published": False}, ensure_ascii=False, indent=2))
+    except Exception as exc:  # noqa: BLE001 - CLI 邊界必須回傳結構化錯誤
+        result = {
+            "status": "internal-error",
+            "message": str(exc),
+            "submitted": False,
+            "pr_created": False,
+            "merged": False,
+        }
+        print(json.dumps(result, ensure_ascii=False, indent=2))
         return 1
 
 
