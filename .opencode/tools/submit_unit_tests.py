@@ -73,6 +73,9 @@ class Worktree:
     branch: str
 
 
+# COMMAND
+
+
 def run_command(
     command: list[str],
     *,
@@ -174,6 +177,9 @@ def optional_git(repo: Path, *arguments: str) -> str | None:
         timeout=GIT_TIMEOUT_SECONDS,
     )
     return result.stdout.strip() if result.returncode == 0 else None
+
+
+# INPUT
 
 
 def repo_root(value: str) -> Path:
@@ -287,6 +293,217 @@ def validate_request(repo: Path) -> dict[str, Any]:
     }
 
 
+# GITHUB
+
+
+def github_remote(value: str) -> tuple[str, str]:
+    if "://" not in value and re.fullmatch(r"[^@\s]+@[^:\s]+:.+", value):
+        user_host, raw_path = value.split(":", 1)
+        host = user_host.rsplit("@", 1)[-1]
+        path = raw_path
+    else:
+        parsed = urllib.parse.urlparse(value)
+        host = parsed.hostname or ""
+        path = parsed.path
+    repository = urllib.parse.unquote(path).strip("/").removesuffix(".git")
+    if not host or not re.fullmatch(r"[^/\s]+/[^/\s]+", repository):
+        raise RequestError("Git push remote 不是可辨識的 GitHub repository URL")
+    return host.lower(), repository
+
+
+def command_failure(result: subprocess.CompletedProcess[str], message: str) -> RequestError:
+    detail = (result.stdout + result.stderr).strip()[-4000:]
+    return RequestError(message + (f"：{detail}" if detail else ""))
+
+
+def github_environment() -> dict[str, str]:
+    return {
+        **os.environ,
+        "GH_PROMPT_DISABLED": "1",
+        "GH_PAGER": "cat",
+        "NO_COLOR": "1",
+    }
+
+
+def remote_sha(repo: Path, remote: str, branch: str) -> str | None:
+    result = run_command(
+        ["git", "-C", str(repo), "ls-remote", "--exit-code", remote, f"refs/heads/{branch}"],
+        cwd=repo,
+        timeout=GIT_TIMEOUT_SECONDS,
+    )
+    if result.returncode == 2:
+        return None
+    if result.returncode != 0:
+        raise command_failure(result, f"無法查詢遠端分支 {remote}/{branch}")
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise RequestError(f"遠端分支 {remote}/{branch} 回傳非預期結果")
+    sha, separator, reference = lines[0].partition("\t")
+    if separator != "\t" or reference != f"refs/heads/{branch}" or not re.fullmatch(r"[0-9a-fA-F]{40,64}", sha):
+        raise RequestError(f"遠端分支 {remote}/{branch} 的 SHA 格式無效")
+    return sha.lower()
+
+
+def require_remote_sha(repo: Path, remote: str, branch: str, expected: str, stage: str) -> None:
+    actual = remote_sha(repo, remote, branch)
+    if actual != expected:
+        raise RequestError(
+            f"{stage}的遠端 {remote}/{branch} 已移動：預期 {expected}，實際 {actual or '(不存在)'}"
+        )
+
+
+def base_context(repo: Path) -> BaseContext:
+    status = git(repo, "status", "--porcelain=v1", "--untracked-files=all")
+    if status:
+        preview = "；".join(status.splitlines()[:5])
+        raise RequestError(f"建立子代理分支前，基準 worktree 必須沒有未提交變更：{preview}")
+
+    branch = optional_git(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
+    if not branch:
+        raise RequestError("基準 worktree 不得處於 detached HEAD")
+    if branch != TRUSTED_BASE_BRANCH:
+        raise RequestError(f"必須從受信任基準分支 {TRUSTED_BASE_BRANCH} 啟動，目前分支為 {branch}")
+    head_sha = git(repo, "rev-parse", "HEAD").lower()
+    remote = optional_git(repo, "config", "--get", f"branch.{branch}.remote")
+    merge_ref = optional_git(repo, "config", "--get", f"branch.{branch}.merge")
+    if not remote or remote == "." or not merge_ref or not merge_ref.startswith("refs/heads/"):
+        raise RequestError(f"目前分支 {branch} 必須追蹤 GitHub 遠端分支")
+    remote_branch = merge_ref.removeprefix("refs/heads/")
+    if remote_branch != TRUSTED_BASE_BRANCH:
+        raise RequestError(
+            f"基準分支 {branch} 必須追蹤遠端 {TRUSTED_BASE_BRANCH}，目前追蹤 {remote_branch}"
+        )
+    upstream_sha = git(repo, "rev-parse", "@{upstream}").lower()
+    if head_sha != upstream_sha:
+        raise RequestError(f"目前 HEAD 與本機追蹤分支 {remote}/{remote_branch} 不一致")
+
+    remote_url = git(repo, "remote", "get-url", "--push", remote)
+    host, repository = github_remote(remote_url)
+    require_remote_sha(repo, remote, remote_branch, head_sha, "建立工作前")
+
+    if shutil.which("gh") is None:
+        raise RequestError("找不到 GitHub CLI gh，無法建立 Draft PR")
+    auth = run_command(
+        ["gh", "auth", "status", "--hostname", host],
+        cwd=repo,
+        timeout=GITHUB_TIMEOUT_SECONDS,
+        env=github_environment(),
+    )
+    if auth.returncode != 0:
+        raise command_failure(auth, f"GitHub CLI 尚未登入 {host}")
+    return BaseContext(branch, head_sha, remote, remote_branch, host, repository)
+
+
+# WORKTREE
+
+
+def branch_name(session_id: str, request: dict[str, Any]) -> str:
+    simple_name = request["target_class"].rsplit(".", 1)[-1]
+    slug = re.sub(r"[^a-z0-9]+", "-", simple_name.lower()).strip("-") or "java-test"
+    digest_input = "\0".join(
+        (session_id, request["target_class"], request["file"]["path"], request["file"]["content"])
+    )
+    digest = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()[:12]
+    return f"{BRANCH_PREFIX}/{slug[:48]}-{digest}"
+
+
+def ensure_branch_available(repo: Path, base: BaseContext, branch: str) -> None:
+    local = run_command(
+        ["git", "-C", str(repo), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=repo,
+        timeout=GIT_TIMEOUT_SECONDS,
+    )
+    if local.returncode == 0:
+        raise BranchConflictError(f"本機分支已存在，需要人工確認先前提交結果：{branch}")
+    if local.returncode != 1:
+        raise command_failure(local, f"無法檢查本機分支 {branch}")
+    if remote_sha(repo, base.remote, branch) is not None:
+        raise BranchConflictError(f"遠端分支已存在，需要人工確認先前提交或 PR：{base.remote}/{branch}")
+
+
+def create_worktree(repo: Path, base: BaseContext, branch: str) -> Worktree:
+    ensure_branch_available(repo, base, branch)
+    root = Path(tempfile.mkdtemp(prefix="opencode-unit-test-"))
+    project = root / "repo"
+    result = run_command(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            branch,
+            str(project),
+            base.head_sha,
+        ],
+        cwd=repo,
+        timeout=GIT_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        shutil.rmtree(root, ignore_errors=True)
+        run_command(
+            ["git", "-C", str(repo), "branch", "-D", "--", branch],
+            cwd=repo,
+            timeout=GIT_TIMEOUT_SECONDS,
+            allow_cancelled=True,
+        )
+        raise command_failure(result, f"無法建立測試 worktree {branch}")
+    return Worktree(root, project, branch)
+
+
+def create_validation_copy(source: Path, project: Path) -> None:
+    source_root = source.resolve()
+
+    def ignored(path: str, names: list[str]) -> set[str]:
+        result = {name for name in names if name in {".git", ".opencode"}}
+        if Path(path).resolve() == source_root and "target" in names:
+            result.add("target")
+        return result
+
+    shutil.copytree(
+        source,
+        project,
+        symlinks=True,
+        ignore=ignored,
+    )
+    if (project / ".git").exists():
+        raise RequestError("Maven 驗證副本不得包含 .git")
+
+
+def cleanup_worktree(repo: Path, worktree: Worktree | None, delete_branch: bool) -> list[str]:
+    if worktree is None:
+        return []
+    warnings: list[str] = []
+    removed = run_command(
+        ["git", "-C", str(repo), "worktree", "remove", "--force", str(worktree.project)],
+        cwd=repo,
+        timeout=GIT_TIMEOUT_SECONDS,
+        allow_cancelled=True,
+    )
+    if removed.returncode != 0:
+        warnings.append(
+            f"Git 無法移除暫存 worktree；為避免留下失效的 Git 登錄，已保留於 {worktree.project}，"
+            "需要人工執行 git worktree remove --force <path>"
+        )
+        return warnings
+    shutil.rmtree(worktree.root, ignore_errors=True)
+    if delete_branch:
+        deleted = run_command(
+            ["git", "-C", str(repo), "branch", "-D", "--", worktree.branch],
+            cwd=repo,
+            timeout=GIT_TIMEOUT_SECONDS,
+            allow_cancelled=True,
+        )
+        if deleted.returncode != 0:
+            warnings.append(f"無法刪除工具建立的本機分支 {worktree.branch}")
+    return warnings
+
+
+# APPLY
+
+
 def atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
@@ -299,6 +516,34 @@ def atomic_write(path: Path, content: str) -> None:
 
 def write_candidate(root: Path, file: dict[str, str]) -> None:
     atomic_write(destination(root, PurePosixPath(file["path"])), file["content"])
+
+
+def git_nul_paths(repo: Path, *arguments: str) -> set[str]:
+    result = run_command(
+        ["git", "-C", str(repo), *arguments],
+        cwd=repo,
+        timeout=GIT_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        raise command_failure(result, "無法檢查 Git 變更清單")
+    return {value for value in result.stdout.split("\0") if value}
+
+
+def changed_paths(repo: Path) -> set[str]:
+    return (
+        git_nul_paths(repo, "diff", "--name-only", "-z", "--")
+        | git_nul_paths(repo, "diff", "--cached", "--name-only", "-z", "--")
+        | git_nul_paths(repo, "ls-files", "--others", "--exclude-standard", "-z")
+    )
+
+
+def require_only_path(actual: set[str], expected: str, stage: str) -> None:
+    if actual != {expected}:
+        shown = ", ".join(sorted(actual)) if actual else "(沒有變更)"
+        raise RequestError(f"{stage} 的 Git 變更不只包含 {expected}：{shown}")
+
+
+# VALIDATE
 
 
 def run_maven(project: Path, candidate_class: str) -> dict[str, Any]:
@@ -464,204 +709,6 @@ def coverage_summary(project: Path, target_class: str) -> dict[str, Any]:
     }
 
 
-def github_remote(value: str) -> tuple[str, str]:
-    if "://" not in value and re.fullmatch(r"[^@\s]+@[^:\s]+:.+", value):
-        user_host, raw_path = value.split(":", 1)
-        host = user_host.rsplit("@", 1)[-1]
-        path = raw_path
-    else:
-        parsed = urllib.parse.urlparse(value)
-        host = parsed.hostname or ""
-        path = parsed.path
-    repository = urllib.parse.unquote(path).strip("/").removesuffix(".git")
-    if not host or not re.fullmatch(r"[^/\s]+/[^/\s]+", repository):
-        raise RequestError("Git push remote 不是可辨識的 GitHub repository URL")
-    return host.lower(), repository
-
-
-def command_failure(result: subprocess.CompletedProcess[str], message: str) -> RequestError:
-    detail = (result.stdout + result.stderr).strip()[-4000:]
-    return RequestError(message + (f"：{detail}" if detail else ""))
-
-
-def github_environment() -> dict[str, str]:
-    return {
-        **os.environ,
-        "GH_PROMPT_DISABLED": "1",
-        "GH_PAGER": "cat",
-        "NO_COLOR": "1",
-    }
-
-
-def remote_sha(repo: Path, remote: str, branch: str) -> str | None:
-    result = run_command(
-        ["git", "-C", str(repo), "ls-remote", "--exit-code", remote, f"refs/heads/{branch}"],
-        cwd=repo,
-        timeout=GIT_TIMEOUT_SECONDS,
-    )
-    if result.returncode == 2:
-        return None
-    if result.returncode != 0:
-        raise command_failure(result, f"無法查詢遠端分支 {remote}/{branch}")
-    lines = [line for line in result.stdout.splitlines() if line.strip()]
-    if len(lines) != 1:
-        raise RequestError(f"遠端分支 {remote}/{branch} 回傳非預期結果")
-    sha, separator, reference = lines[0].partition("\t")
-    if separator != "\t" or reference != f"refs/heads/{branch}" or not re.fullmatch(r"[0-9a-fA-F]{40,64}", sha):
-        raise RequestError(f"遠端分支 {remote}/{branch} 的 SHA 格式無效")
-    return sha.lower()
-
-
-def require_remote_sha(repo: Path, remote: str, branch: str, expected: str, stage: str) -> None:
-    actual = remote_sha(repo, remote, branch)
-    if actual != expected:
-        raise RequestError(
-            f"{stage}的遠端 {remote}/{branch} 已移動：預期 {expected}，實際 {actual or '(不存在)'}"
-        )
-
-
-def base_context(repo: Path) -> BaseContext:
-    status = git(repo, "status", "--porcelain=v1", "--untracked-files=all")
-    if status:
-        preview = "；".join(status.splitlines()[:5])
-        raise RequestError(f"建立子代理分支前，基準 worktree 必須沒有未提交變更：{preview}")
-
-    branch = optional_git(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
-    if not branch:
-        raise RequestError("基準 worktree 不得處於 detached HEAD")
-    if branch != TRUSTED_BASE_BRANCH:
-        raise RequestError(f"必須從受信任基準分支 {TRUSTED_BASE_BRANCH} 啟動，目前分支為 {branch}")
-    head_sha = git(repo, "rev-parse", "HEAD").lower()
-    remote = optional_git(repo, "config", "--get", f"branch.{branch}.remote")
-    merge_ref = optional_git(repo, "config", "--get", f"branch.{branch}.merge")
-    if not remote or remote == "." or not merge_ref or not merge_ref.startswith("refs/heads/"):
-        raise RequestError(f"目前分支 {branch} 必須追蹤 GitHub 遠端分支")
-    remote_branch = merge_ref.removeprefix("refs/heads/")
-    if remote_branch != TRUSTED_BASE_BRANCH:
-        raise RequestError(
-            f"基準分支 {branch} 必須追蹤遠端 {TRUSTED_BASE_BRANCH}，目前追蹤 {remote_branch}"
-        )
-    upstream_sha = git(repo, "rev-parse", "@{upstream}").lower()
-    if head_sha != upstream_sha:
-        raise RequestError(f"目前 HEAD 與本機追蹤分支 {remote}/{remote_branch} 不一致")
-
-    remote_url = git(repo, "remote", "get-url", "--push", remote)
-    host, repository = github_remote(remote_url)
-    require_remote_sha(repo, remote, remote_branch, head_sha, "建立工作前")
-
-    if shutil.which("gh") is None:
-        raise RequestError("找不到 GitHub CLI gh，無法建立 Draft PR")
-    auth = run_command(
-        ["gh", "auth", "status", "--hostname", host],
-        cwd=repo,
-        timeout=GITHUB_TIMEOUT_SECONDS,
-        env=github_environment(),
-    )
-    if auth.returncode != 0:
-        raise command_failure(auth, f"GitHub CLI 尚未登入 {host}")
-    return BaseContext(branch, head_sha, remote, remote_branch, host, repository)
-
-
-def branch_name(session_id: str, request: dict[str, Any]) -> str:
-    simple_name = request["target_class"].rsplit(".", 1)[-1]
-    slug = re.sub(r"[^a-z0-9]+", "-", simple_name.lower()).strip("-") or "java-test"
-    digest_input = "\0".join(
-        (session_id, request["target_class"], request["file"]["path"], request["file"]["content"])
-    )
-    digest = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()[:12]
-    return f"{BRANCH_PREFIX}/{slug[:48]}-{digest}"
-
-
-def ensure_branch_available(repo: Path, base: BaseContext, branch: str) -> None:
-    local = run_command(
-        ["git", "-C", str(repo), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
-        cwd=repo,
-        timeout=GIT_TIMEOUT_SECONDS,
-    )
-    if local.returncode == 0:
-        raise BranchConflictError(f"本機分支已存在，需要人工確認先前提交結果：{branch}")
-    if local.returncode != 1:
-        raise command_failure(local, f"無法檢查本機分支 {branch}")
-    if remote_sha(repo, base.remote, branch) is not None:
-        raise BranchConflictError(f"遠端分支已存在，需要人工確認先前提交或 PR：{base.remote}/{branch}")
-
-
-def create_worktree(repo: Path, base: BaseContext, branch: str) -> Worktree:
-    ensure_branch_available(repo, base, branch)
-    root = Path(tempfile.mkdtemp(prefix="opencode-unit-test-"))
-    project = root / "repo"
-    result = run_command(
-        [
-            "git",
-            "-C",
-            str(repo),
-            "worktree",
-            "add",
-            "--quiet",
-            "-b",
-            branch,
-            str(project),
-            base.head_sha,
-        ],
-        cwd=repo,
-        timeout=GIT_TIMEOUT_SECONDS,
-    )
-    if result.returncode != 0:
-        shutil.rmtree(root, ignore_errors=True)
-        run_command(
-            ["git", "-C", str(repo), "branch", "-D", "--", branch],
-            cwd=repo,
-            timeout=GIT_TIMEOUT_SECONDS,
-            allow_cancelled=True,
-        )
-        raise command_failure(result, f"無法建立測試 worktree {branch}")
-    return Worktree(root, project, branch)
-
-
-def create_validation_copy(source: Path, project: Path) -> None:
-    source_root = source.resolve()
-
-    def ignored(path: str, names: list[str]) -> set[str]:
-        result = {name for name in names if name in {".git", ".opencode"}}
-        if Path(path).resolve() == source_root and "target" in names:
-            result.add("target")
-        return result
-
-    shutil.copytree(
-        source,
-        project,
-        symlinks=True,
-        ignore=ignored,
-    )
-    if (project / ".git").exists():
-        raise RequestError("Maven 驗證副本不得包含 .git")
-
-
-def git_nul_paths(repo: Path, *arguments: str) -> set[str]:
-    result = run_command(
-        ["git", "-C", str(repo), *arguments],
-        cwd=repo,
-        timeout=GIT_TIMEOUT_SECONDS,
-    )
-    if result.returncode != 0:
-        raise command_failure(result, "無法檢查 Git 變更清單")
-    return {value for value in result.stdout.split("\0") if value}
-
-
-def changed_paths(repo: Path) -> set[str]:
-    return (
-        git_nul_paths(repo, "diff", "--name-only", "-z", "--")
-        | git_nul_paths(repo, "diff", "--cached", "--name-only", "-z", "--")
-        | git_nul_paths(repo, "ls-files", "--others", "--exclude-standard", "-z")
-    )
-
-
-def require_only_path(actual: set[str], expected: str, stage: str) -> None:
-    if actual != {expected}:
-        shown = ", ".join(sorted(actual)) if actual else "(沒有變更)"
-        raise RequestError(f"{stage} 的 Git 變更不只包含 {expected}：{shown}")
-
-
 def validation_failure(
     status: str,
     message: str,
@@ -737,6 +784,9 @@ def validate_candidate(project: Path, request: dict[str, Any]) -> tuple[dict[str
     if destination(project, PurePosixPath(expected_path)).read_text(encoding="utf-8") != request["file"]["content"]:
         raise RequestError("Maven 驗證後的候選測試內容與提交內容不一致")
     return validation, None
+
+
+# SUBMIT
 
 
 def commit_candidate(project: Path, base: BaseContext, request: dict[str, Any]) -> tuple[str, str]:
@@ -936,35 +986,6 @@ def compare_url(base: BaseContext, branch: str) -> str:
     old = urllib.parse.quote(base.remote_branch, safe="")
     new = urllib.parse.quote(branch, safe="")
     return f"https://{base.github_host}/{base.github_repository}/compare/{old}...{new}?expand=1"
-
-
-def cleanup_worktree(repo: Path, worktree: Worktree | None, delete_branch: bool) -> list[str]:
-    if worktree is None:
-        return []
-    warnings: list[str] = []
-    removed = run_command(
-        ["git", "-C", str(repo), "worktree", "remove", "--force", str(worktree.project)],
-        cwd=repo,
-        timeout=GIT_TIMEOUT_SECONDS,
-        allow_cancelled=True,
-    )
-    if removed.returncode != 0:
-        warnings.append(
-            f"Git 無法移除暫存 worktree；為避免留下失效的 Git 登錄，已保留於 {worktree.project}，"
-            "需要人工執行 git worktree remove --force <path>"
-        )
-        return warnings
-    shutil.rmtree(worktree.root, ignore_errors=True)
-    if delete_branch:
-        deleted = run_command(
-            ["git", "-C", str(repo), "branch", "-D", "--", worktree.branch],
-            cwd=repo,
-            timeout=GIT_TIMEOUT_SECONDS,
-            allow_cancelled=True,
-        )
-        if deleted.returncode != 0:
-            warnings.append(f"無法刪除工具建立的本機分支 {worktree.branch}")
-    return warnings
 
 
 def submit(repo: Path, session_id: str, request: dict[str, Any]) -> dict[str, Any]:
@@ -1170,6 +1191,9 @@ def submit(repo: Path, session_id: str, request: dict[str, Any]) -> dict[str, An
     if warnings:
         result["cleanup_warnings"] = warnings
     return result
+
+
+# CLI
 
 
 def main() -> int:
