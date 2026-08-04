@@ -368,7 +368,10 @@ def review(repo: Path, request: dict[str, Any]) -> dict[str, Any]:
         if maven["exit_code"] != 0:
             return {
                 "status": "candidate-check-failed",
-                "message": "候選測試未通過 Maven test；請 Agent 修正後重新提交。",
+                "message": (
+                    "候選測試未通過 Maven test；請依規格證據判斷是候選測試錯誤"
+                    "或可能的正式原始碼缺陷。不得自動修改 expected。"
+                ),
                 "validation": validation,
                 "failure_tail": maven["failure_tail"],
                 "published": False,
