@@ -9,6 +9,22 @@
 - `POST /api/order-placements`：執行輸入驗證、冪等檢查、風險分流、庫存保留、付款授權、失敗補償與結果保存。
 - `OrderLifecyclePolicy`：管理訂單從草稿、待付款、確認、出貨到終止狀態的合法轉移。
 
+## 專案分層
+
+訂單放行功能採用 Spring Boot 企業專案常見的依功能分套件，再於功能內分層：
+
+- `order/controller`：HTTP 狀態與回應轉換。
+- `order/service`：風險、庫存、付款、補償與冪等流程。
+- `order/dao`：訂單放行結果的資料存取介面與 JPA 實作。
+- `order/entity`：資料庫實體。
+- `order/dto`：API 請求與回應資料。
+- `order/vo`：`OrderId`、`IdempotencyKey` 與 `Money` 等具有不變條件的值物件。
+- `order/mapper`：API、領域結果與資料庫實體之間的轉換。
+- `order/util`：產生冪等請求指紋的純函式工具。
+- `order/config`、`order/exception`、`order/port`、`order/infra`：設定、例外與外部服務邊界。
+
+冪等結果使用 Spring Data JPA 寫入 H2。付款權杖只參與 SHA-256 請求指紋計算，不會寫入資料庫。
+
 ## 權威規格
 
 - `docs/pricing-rules.md`：折扣計算與取位。
@@ -24,6 +40,7 @@
 - Java 17
 - Spring Boot 3
 - Maven Wrapper
+- Spring Data JPA、H2
 - JUnit 5、Mockito、AssertJ
 
 ```bash

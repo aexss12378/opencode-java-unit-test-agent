@@ -1,6 +1,6 @@
 package com.example.legacypricing;
 
-import com.example.legacypricing.order.IdempotencyConflictException;
+import com.example.legacypricing.order.exception.IdempotencyConflictException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;

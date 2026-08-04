@@ -1,4 +1,4 @@
-package com.example.legacypricing.order;
+package com.example.legacypricing.order.exception;
 
 public final class IdempotencyConflictException extends RuntimeException {
 

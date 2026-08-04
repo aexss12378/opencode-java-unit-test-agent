@@ -1,15 +1,16 @@
 package com.example.legacypricing.order;
 
-import java.math.BigDecimal;
+import com.example.legacypricing.order.vo.IdempotencyKey;
+import com.example.legacypricing.order.vo.Money;
+import com.example.legacypricing.order.vo.OrderId;
 
 public record OrderPlacementCommand(
-        String orderId,
-        String idempotencyKey,
+        OrderId orderId,
+        IdempotencyKey idempotencyKey,
         String customerId,
         String sku,
         int quantity,
-        BigDecimal total,
-        String currency,
+        Money total,
         String paymentToken
 ) {
 }

@@ -1,7 +1,10 @@
-package com.example.legacypricing.order.api;
+package com.example.legacypricing.order.controller;
 
 import com.example.legacypricing.order.OrderPlacementResult;
-import com.example.legacypricing.order.application.OrderPlacementUseCase;
+import com.example.legacypricing.order.dto.OrderPlacementRequest;
+import com.example.legacypricing.order.dto.OrderPlacementResponse;
+import com.example.legacypricing.order.mapper.OrderPlacementApiMapper;
+import com.example.legacypricing.order.service.OrderPlacementUseCase;
 import jakarta.validation.Valid;
 import java.util.Objects;
 import org.springframework.http.HttpStatus;
@@ -16,12 +19,17 @@ import org.springframework.web.bind.annotation.RestController;
 public final class OrderPlacementController {
 
     private final OrderPlacementUseCase orderPlacementUseCase;
+    private final OrderPlacementApiMapper mapper;
 
-    public OrderPlacementController(OrderPlacementUseCase orderPlacementUseCase) {
+    public OrderPlacementController(
+            OrderPlacementUseCase orderPlacementUseCase,
+            OrderPlacementApiMapper mapper
+    ) {
         this.orderPlacementUseCase = Objects.requireNonNull(
                 orderPlacementUseCase,
                 "orderPlacementUseCase"
         );
+        this.mapper = Objects.requireNonNull(mapper, "mapper");
     }
 
     /**
@@ -32,13 +40,13 @@ public final class OrderPlacementController {
     public ResponseEntity<OrderPlacementResponse> place(
             @Valid @RequestBody OrderPlacementRequest request
     ) {
-        OrderPlacementResult result = orderPlacementUseCase.place(request.toCommand());
+        OrderPlacementResult result = orderPlacementUseCase.place(mapper.toCommand(request));
         HttpStatus status = switch (result.status()) {
             case ACCEPTED -> HttpStatus.CREATED;
             case MANUAL_REVIEW -> HttpStatus.ACCEPTED;
             case OUT_OF_STOCK -> HttpStatus.CONFLICT;
             case RISK_REJECTED, PAYMENT_DECLINED -> HttpStatus.UNPROCESSABLE_ENTITY;
         };
-        return ResponseEntity.status(status).body(OrderPlacementResponse.from(result));
+        return ResponseEntity.status(status).body(mapper.toResponse(result));
     }
 }
