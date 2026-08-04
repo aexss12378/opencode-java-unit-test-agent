@@ -370,7 +370,8 @@ def review(repo: Path, request: dict[str, Any]) -> dict[str, Any]:
                 "status": "candidate-check-failed",
                 "message": (
                     "候選測試未通過 Maven test；請依規格證據判斷是候選測試錯誤"
-                    "或可能的正式原始碼缺陷。不得自動修改 expected。"
+                    "或可能的正式原始碼缺陷。不得自動修改 expected；確認為規格與實作"
+                    "衝突時，標記該案例並繼續處理其他案例。"
                 ),
                 "validation": validation,
                 "failure_tail": maven["failure_tail"],
