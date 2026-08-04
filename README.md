@@ -11,8 +11,12 @@
 
 ## 專案分層
 
-訂單放行功能採用 Spring Boot 企業專案常見的依功能分套件，再於功能內分層：
+專案採用 Spring Boot 企業專案常見的依功能分套件，再於功能內分層。根套件只保留 `EnterpriseOrderApplication` 啟動類別：
 
+- `common/api`：共用 API 錯誤格式與例外轉換。
+- `checkout/controller`、`dto`、`model`、`service`、`port`、`infra`：結帳與庫存保留流程。
+- `pricing/controller`、`dto`、`service`、`calculator`、`policy`、`config`：報價、折扣、稅額、運費與付款期限。
+- `customer/service`：顧客標籤行為。
 - `order/controller`：HTTP 狀態與回應轉換。
 - `order/service`：風險、庫存、付款、補償與冪等流程。
 - `order/dao`：訂單放行結果的資料存取介面與 JPA 實作。
