@@ -68,7 +68,7 @@ description: 為 Spring Boot 或 Maven Java 專案盤點、設計、撰寫、補
 
 ## 撰寫 JUnit 候選測試
 
-- 沿用專案既有的測試相依套件與風格，不修改 `pom.xml`。
+- 沿用專案既有的測試相依套件與命名風格，不修改 `pom.xml`；斷言一律遵守下列 AssertJ 規則。
 - 每次只建立或更新一個 `src/test/java/**/*Test.java`，套件、路徑、檔名與類別名稱必須一致。
 - 預設以 `new` 建立真實受測類別，並以建構子注入必要依賴。
 - 不啟動 Spring，不使用網路、資料庫或檔案系統，也不啟動外部程序。時間與隨機行為使用可注入的固定來源。
@@ -76,9 +76,9 @@ description: 為 Spring Boot 或 Maven Java 專案盤點、設計、撰寫、補
 - 每個測試方法只驗證一項明確行為，採 Arrange-Act-Assert 結構。
 - 使用情境與結果命名，例如 `shouldRejectOrderWhenQuantityIsZero`。
 - 只在同一規則需要多組輸入時使用參數化測試。
-- 使用專案既有的 JUnit 斷言；AssertJ 已存在時可用於提高可讀性。不得使用 Java 原生 `assert`。
+- 先確認 `pom.xml` 已提供 AssertJ。結果、狀態與例外斷言一律使用 AssertJ；JUnit 只用於 `@Test`、參數化測試等測試生命週期功能。不得匯入或呼叫 `org.junit.jupiter.api.Assertions`，也不得使用 Java 原生 `assert`。若專案未提供 AssertJ，停止並回報缺少相依套件，不修改 `pom.xml`。
 - 斷言具體的值、狀態或例外型別；不得只檢查非空、未拋例外或呼叫成功。
-- 使用 `assertThrows` 驗證例外型別，不重複斷言相同型別。只有規格明確要求時才驗證例外訊息。
+- 使用 AssertJ 的 `assertThatThrownBy` 或對應的例外斷言驗證例外型別。只有規格明確要求時才驗證例外訊息。
 - 將案例編號放在對應方法的 `@DisplayName` 或相鄰註解中。
 
 ## 需要測試替身時使用 Mockito
@@ -131,3 +131,4 @@ description: 為 Spring Boot 或 Maven Java 專案盤點、設計、撰寫、補
 7. Mockito 僅用於必要的直接協作者；每個互動驗證都有規格依據。
 8. 候選內容只包含一個測試檔，且每個案例編號都出現在對應測試方法旁。
 9. 每個規格與實作衝突都已另外列出，且候選測試與完成回報沒有宣稱涵蓋衝突規則。
+10. 結果、狀態與例外斷言全部使用 AssertJ；沒有 `org.junit.jupiter.api.Assertions` 或 Java 原生 `assert`。
