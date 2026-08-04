@@ -489,7 +489,7 @@ class DraftPullRequestCommandTest(unittest.TestCase):
             "candidate_tests": {"executed": 1},
             "coverage": {"percent": 100.0, "minimum_percent": 80},
         }
-        branch = "codex/unit-test/alpha-123456789abc"
+        branch = "opencode/unit-test/alpha-123456789abc"
         head_sha = "b" * 40
         commands: list[list[str]] = []
 
@@ -557,7 +557,7 @@ class DraftPullRequestCommandTest(unittest.TestCase):
                 request,
                 validation,
                 base,
-                "codex/unit-test/alpha-timeout",
+                "opencode/unit-test/alpha-timeout",
                 "b" * 40,
                 "c" * 64,
             )
@@ -570,7 +570,7 @@ class PureFunctionTest(unittest.TestCase):
         second = backend.branch_name("session-two", request)
         self.assertNotEqual(first, second)
         self.assertEqual(first, backend.branch_name("session-one", request))
-        self.assertTrue(first.startswith("codex/unit-test/alpha-"))
+        self.assertTrue(first.startswith("opencode/unit-test/alpha-"))
 
     def test_github_remote_parses_https_and_ssh(self) -> None:
         expected = ("github.com", "owner/repository")
