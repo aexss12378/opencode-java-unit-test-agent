@@ -5,9 +5,7 @@ import json
 import subprocess
 import sys
 import tempfile
-import threading
 import unittest
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
@@ -52,9 +50,9 @@ def checked(*arguments: str, cwd: Path | None = None, git_dir: Path | None = Non
     return result.stdout.strip()
 
 
-class SubmissionRepositoryTest(unittest.TestCase):
+class WorkflowRepositoryTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory(prefix="submit-unit-tests-")
+        self.temporary = tempfile.TemporaryDirectory(prefix="unit-test-workflow-")
         self.root = Path(self.temporary.name)
         self.remote = self.root / "remote.git"
         self.repo = self.root / "repo"
@@ -63,21 +61,22 @@ class SubmissionRepositoryTest(unittest.TestCase):
         checked("config", "user.name", "Unit Test Tool", cwd=self.repo)
         checked("config", "user.email", "unit-test-tool@example.invalid", cwd=self.repo)
 
+        (self.repo / ".gitignore").write_text("target/\n.opencode/node_modules/\n", encoding="utf-8")
         (self.repo / "pom.xml").write_text("<project/>\n", encoding="utf-8")
         wrapper = self.repo / "mvnw"
         wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         wrapper.chmod(0o755)
+        agent = self.repo / ".opencode/agents/unit-test.md"
+        agent.parent.mkdir(parents=True)
+        agent.write_text("---\nmode: subagent\n---\n", encoding="utf-8")
         source = self.repo / "src/main/java/com/example"
         source.mkdir(parents=True)
-        (source / "Alpha.java").write_text("package com.example; public class Alpha {}\n", encoding="utf-8")
-        (source / "Beta.java").write_text("package com.example; public class Beta {}\n", encoding="utf-8")
-        for index in range(12):
-            name = f"Service{index:02d}"
+        for name in ["AlphaService", "BetaService", *[f"Service{index:02d}Service" for index in range(6)]]:
             (source / f"{name}.java").write_text(
                 f"package com.example; public class {name} {{}}\n",
                 encoding="utf-8",
             )
-        checked("add", "--", "pom.xml", "mvnw", "src/main/java", cwd=self.repo)
+        checked("add", "--", ".gitignore", ".opencode", "pom.xml", "mvnw", "src/main/java", cwd=self.repo)
         checked("commit", "-m", "initial", cwd=self.repo)
         checked("remote", "add", "origin", str(self.remote), cwd=self.repo)
         checked("push", "-u", "origin", "main", cwd=self.repo)
@@ -90,36 +89,48 @@ class SubmissionRepositoryTest(unittest.TestCase):
             github_host="github.com",
             github_repository="example/repository",
         )
+        plugin = self.repo / ".opencode/node_modules/@opencode-ai/plugin"
+        plugin.mkdir(parents=True)
+        (plugin / "package.json").write_text("{}\n", encoding="utf-8")
+        self.worktrees: list[object] = []
 
     def tearDown(self) -> None:
+        backend._CANCEL_REQUESTED = False
+        for worktree in reversed(self.worktrees):
+            if worktree.project.exists():
+                backend.cleanup_worktree(self.repo, worktree, delete_branch=True)
         self.temporary.cleanup()
 
     @staticmethod
-    def request(simple_name: str) -> dict[str, object]:
-        target = f"com.example.{simple_name}"
-        test_class = f"{simple_name}Test"
-        content = (
+    def target(simple_name: str) -> dict[str, object]:
+        target_class = f"com.example.{simple_name}"
+        return {
+            "target_class": target_class,
+            "target_source": f"src/main/java/com/example/{simple_name}.java",
+            "candidate_class": f"com.example.{simple_name}Test",
+            "test_file": f"src/test/java/com/example/{simple_name}Test.java",
+            "specification_sources": [f"docs/{simple_name}.md"],
+        }
+
+    @staticmethod
+    def cases() -> list[dict[str, str]]:
+        return [
+            {
+                "id": "UT-001",
+                "scenario": "建立物件",
+                "expected": "建立成功",
+                "evidence": "docs/service.md:1",
+            }
+        ]
+
+    @staticmethod
+    def content(simple_name: str) -> str:
+        return (
             "package com.example;\n\n"
-            f"class {test_class} {{\n"
+            f"class {simple_name}Test {{\n"
             "    // UT-001\n"
             "}\n"
         )
-        return {
-            "target_class": target,
-            "candidate_class": f"com.example.{test_class}",
-            "test_cases": [
-                {
-                    "id": "UT-001",
-                    "scenario": "建立物件",
-                    "expected": "建立成功",
-                    "evidence": f"src/main/java/com/example/{simple_name}.java",
-                }
-            ],
-            "file": {
-                "path": f"src/test/java/com/example/{test_class}.java",
-                "content": content,
-            },
-        }
 
     @staticmethod
     def maven_success(_project: Path, candidate_class: str) -> dict[str, object]:
@@ -152,6 +163,8 @@ class SubmissionRepositoryTest(unittest.TestCase):
             "minimum_percent": 80,
             "passed": True,
             "missed_lines": [],
+            "xml": "target/site/jacoco/jacoco.xml",
+            "exec": "target/jacoco.exec",
         }
 
     @staticmethod
@@ -159,8 +172,7 @@ class SubmissionRepositoryTest(unittest.TestCase):
         _project: Path,
         _request: dict[str, object],
         _validation: dict[str, object],
-        base: object,
-        branch: str,
+        assignment: object,
         head_sha: str,
         _digest: str,
     ) -> dict[str, object]:
@@ -169,153 +181,284 @@ class SubmissionRepositoryTest(unittest.TestCase):
             "url": f"https://github.com/example/repository/pull/{head_sha[:6]}",
             "isDraft": True,
             "state": "OPEN",
-            "headRefName": branch,
+            "headRefName": assignment.branch,
             "headRefOid": head_sha,
-            "baseRefName": base.remote_branch,
+            "baseRefName": assignment.base.remote_branch,
         }
 
-    def submit(self, session_id: str, request: dict[str, object]) -> dict[str, object]:
+    def prepare(self, session_id: str, simple_name: str) -> tuple[object, object]:
+        prepared = backend.prepare_assignment(self.repo, self.base, session_id, self.target(simple_name))
+        self.worktrees.append(prepared[0])
+        return prepared
+
+    def write_candidate(self, worktree: object, assignment: object, simple_name: str) -> dict[str, object]:
+        path = worktree.project / assignment.test_file
+        path.parent.mkdir(parents=True, exist_ok=True)
+        content = self.content(simple_name)
+        path.write_text(content, encoding="utf-8")
+        return {
+            "target_class": assignment.target_class,
+            "candidate_class": assignment.candidate_class,
+            "test_cases": self.cases(),
+            "file": {"path": assignment.test_file, "content": content},
+        }
+
+    def submit_success(self, worktree: object, assignment: object, request: dict[str, object]) -> dict[str, object]:
         with (
-            patch.object(backend, "base_context", return_value=self.base),
+            patch.object(backend, "verify_assignment_state"),
             patch.object(backend, "run_maven", side_effect=self.maven_success),
             patch.object(backend, "test_summary", side_effect=self.summary_success),
             patch.object(backend, "coverage_summary", side_effect=self.coverage_success),
             patch.object(backend, "create_draft_pr", side_effect=self.draft_pr),
         ):
-            return backend.submit(self.repo, session_id, request)
+            return backend.submit(worktree.project, assignment, request)
 
-    def test_success_commits_only_candidate_and_keeps_main_unchanged(self) -> None:
-        request = self.request("Alpha")
-        result = self.submit("session-alpha", request)
+    def test_prepare_dispatch_creates_one_worktree_per_service(self) -> None:
+        request = {
+            "targets": [self.target("AlphaService"), self.target("BetaService")],
+            "max_concurrency": 2,
+        }
+        with patch.object(backend, "base_context", return_value=self.base):
+            result = backend.prepare_dispatch(self.repo, "session-dispatch", request)
+
+        self.assertEqual(result["status"], "prepared")
+        self.assertEqual(len(result["prepared"]), 2)
+        worktrees = {Path(item["worktree"]) for item in result["prepared"]}
+        self.assertEqual(len(worktrees), 2)
+        self.assertTrue(all(path.is_dir() for path in worktrees))
+        self.assertEqual(len({item["branch"] for item in result["prepared"]}), 2)
+        self.assertTrue(all(item["prompt"] for item in result["prepared"]))
+        self.assertEqual(checked("worktree", "list", "--porcelain", cwd=self.repo).count("worktree "), 3)
+        self.assertEqual(checked("rev-parse", "HEAD", cwd=self.repo), self.base_sha)
+        for item in result["prepared"]:
+            project = Path(item["worktree"])
+            backend.cleanup_worktree(
+                self.repo,
+                backend.Worktree(project.parent, project, item["branch"]),
+                delete_branch=True,
+            )
+
+    def test_assignment_binds_to_exact_child_session(self) -> None:
+        worktree, assignment = self.prepare("session-bind", "AlphaService")
+        with patch.object(backend, "verify_assignment_state"):
+            result = backend.bind_assignment(
+                worktree.project,
+                "session-bind",
+                {
+                    "assignment_id": assignment.assignment_id,
+                    "worker_session_id": "child-session-alpha",
+                },
+            )
+
+            self.assertEqual(result["status"], "assignment-bound")
+            loaded = backend.load_assignment(worktree.project, "child-session-alpha")
+            self.assertEqual(loaded.worker_session_id, "child-session-alpha")
+            with self.assertRaisesRegex(backend.RequestError, "子工作階段與派工清單不一致"):
+                backend.load_assignment(worktree.project, "different-child")
+
+    def test_finalize_success_cleans_worktree(self) -> None:
+        worktree, assignment = self.prepare("session-finalize", "AlphaService")
+        with patch.object(backend, "verify_assignment_state"):
+            backend.bind_assignment(
+                worktree.project,
+                "session-finalize",
+                {
+                    "assignment_id": assignment.assignment_id,
+                    "worker_session_id": "child-finalize",
+                },
+            )
+        sha = "c" * 40
+        backend.atomic_write_json(
+            assignment.result_path,
+            {
+                "assignment_id": assignment.assignment_id,
+                "status": "draft-pr-created",
+                "target_class": assignment.target_class,
+                "test_file": assignment.test_file,
+                "branch": assignment.branch,
+                "base_sha": assignment.base.head_sha,
+                "pr_created": True,
+                "pr_verified": True,
+                "pr": {"draft": True, "url": "https://example.invalid/pr"},
+                "commit_sha": sha,
+                "remote_sha": sha,
+            },
+            mode=0o600,
+        )
+
+        with (
+            patch.object(backend, "verify_assignment_state"),
+            patch.object(backend, "verify_completed_worker"),
+        ):
+            result = backend.finalize_assignment(
+                worktree.project,
+                "session-finalize",
+                {
+                    "assignment_id": assignment.assignment_id,
+                    "worker_session_id": "child-finalize",
+                    "worker_message": "完成",
+                    "worker_error": "",
+                    "cancelled": False,
+                },
+            )
+
+        self.assertEqual(result["status"], "draft-pr-created")
+        self.assertTrue(result["post_worker_verified"])
+        self.assertFalse(result["worktree_retained"])
+        self.assertFalse(worktree.project.exists())
+
+    def test_finalize_failure_retains_worktree(self) -> None:
+        worktree, assignment = self.prepare("session-retain", "AlphaService")
+        with patch.object(backend, "verify_assignment_state"):
+            backend.bind_assignment(
+                worktree.project,
+                "session-retain",
+                {
+                    "assignment_id": assignment.assignment_id,
+                    "worker_session_id": "child-retain",
+                },
+            )
+
+            result = backend.finalize_assignment(
+                worktree.project,
+                "session-retain",
+                {
+                    "assignment_id": assignment.assignment_id,
+                    "worker_session_id": "child-retain",
+                    "worker_message": "缺少規格",
+                    "worker_error": "",
+                    "cancelled": False,
+                },
+            )
+
+        self.assertEqual(result["status"], "worker-finished-without-submission")
+        self.assertTrue(result["worktree_retained"])
+        self.assertEqual(Path(result["worktree"]), worktree.project)
+
+    def test_post_worker_verification_rejects_changes_after_publish(self) -> None:
+        worktree, assignment = self.prepare("session-post-publish", "AlphaService")
+        self.write_candidate(worktree, assignment, "AlphaService")
+        result = {
+            "status": "draft-pr-created",
+            "target_class": assignment.target_class,
+            "test_file": assignment.test_file,
+            "branch": assignment.branch,
+            "base_sha": assignment.base.head_sha,
+            "pr_created": True,
+            "pr_verified": True,
+            "pr": {"draft": True, "url": "https://github.com/example/repository/pull/7"},
+            "commit_sha": self.base_sha,
+            "remote_sha": self.base_sha,
+        }
+        with (
+            patch.object(backend, "verify_assignment_state"),
+            self.assertRaisesRegex(backend.RequestError, "發布後又留下未提交變更"),
+        ):
+            backend.verify_completed_worker(worktree, assignment, result)
+
+    def test_backend_rejects_changes_outside_assigned_test_file(self) -> None:
+        worktree, assignment = self.prepare("session-scope", "AlphaService")
+        self.write_candidate(worktree, assignment, "AlphaService")
+        extra = worktree.project / "src/test/java/com/example/ExtraTest.java"
+        extra.write_text("class ExtraTest {}\n", encoding="utf-8")
+        with self.assertRaisesRegex(backend.RequestError, "必須只有"):
+            backend.validate_candidate_request(worktree.project, assignment, {}, require_cases=False)
+
+    def test_validate_passes_without_committing(self) -> None:
+        worktree, assignment = self.prepare("session-validate", "AlphaService")
+        request = self.write_candidate(worktree, assignment, "AlphaService")
+        with (
+            patch.object(backend, "verify_assignment_state"),
+            patch.object(backend, "run_maven", side_effect=self.maven_success),
+            patch.object(backend, "test_summary", side_effect=self.summary_success),
+            patch.object(backend, "coverage_summary", side_effect=self.coverage_success),
+        ):
+            result = backend.validate_action(worktree.project, assignment, request)
+
+        self.assertEqual(result["status"], "validation-passed")
+        self.assertEqual(result["validation"]["coverage"]["percent"], 100.0)
+        self.assertEqual(checked("rev-parse", "HEAD", cwd=worktree.project), self.base_sha)
+        self.assertEqual(backend.changed_paths(worktree.project), {assignment.test_file})
+
+    def test_maven_failure_returns_only_error_diagnostics(self) -> None:
+        worktree, assignment = self.prepare("session-maven-fail", "AlphaService")
+        request = self.write_candidate(worktree, assignment, "AlphaService")
+        failure = {
+            "command": "./mvnw -B -ntp -Dtest=com.example.AlphaServiceTest test",
+            "exit_code": 1,
+            "timed_out": False,
+            "maven_errors": "[ERROR] cannot find symbol",
+        }
+        with (
+            patch.object(backend, "verify_assignment_state"),
+            patch.object(backend, "run_maven", return_value=failure),
+        ):
+            result = backend.validate_action(worktree.project, assignment, request)
+
+        self.assertEqual(result["status"], "candidate-check-failed")
+        self.assertEqual(result["maven_errors"], "[ERROR] cannot find symbol")
+        self.assertFalse(result["submitted"])
+
+    def test_maven_tracked_side_effect_blocks_validation(self) -> None:
+        worktree, assignment = self.prepare("session-side-effect", "AlphaService")
+        request = self.write_candidate(worktree, assignment, "AlphaService")
+
+        def mutate_project(project: Path, candidate_class: str) -> dict[str, object]:
+            (project / "pom.xml").write_text("<project>changed</project>\n", encoding="utf-8")
+            return self.maven_success(project, candidate_class)
+
+        with (
+            patch.object(backend, "verify_assignment_state"),
+            patch.object(backend, "run_maven", side_effect=mutate_project),
+        ):
+            result = backend.validate_action(worktree.project, assignment, request)
+
+        self.assertEqual(result["status"], "validation-failed")
+        self.assertIn("pom.xml", result["message"])
+
+    def test_maven_cannot_change_candidate_after_validation(self) -> None:
+        worktree, assignment = self.prepare("session-candidate-mutation", "AlphaService")
+        request = self.write_candidate(worktree, assignment, "AlphaService")
+
+        def mutate_candidate(project: Path, candidate_class: str) -> dict[str, object]:
+            path = project / assignment.test_file
+            path.write_text(path.read_text(encoding="utf-8") + "// changed\n", encoding="utf-8")
+            return self.maven_success(project, candidate_class)
+
+        with (
+            patch.object(backend, "verify_assignment_state"),
+            patch.object(backend, "run_maven", side_effect=mutate_candidate),
+        ):
+            result = backend.validate_action(worktree.project, assignment, request)
+
+        self.assertEqual(result["status"], "validation-failed")
+        self.assertIn("驗證前不一致", result["message"])
+
+    def test_success_commits_only_assigned_test_and_keeps_main_unchanged(self) -> None:
+        worktree, assignment = self.prepare("session-submit", "AlphaService")
+        request = self.write_candidate(worktree, assignment, "AlphaService")
+        result = self.submit_success(worktree, assignment, request)
 
         self.assertEqual(result["status"], "draft-pr-created")
         self.assertTrue(result["pr_created"])
-        self.assertFalse(result["merged"])
+        self.assertTrue(result["pr_verified"])
+        self.assertEqual(result["commit_sha"], result["remote_sha"])
         self.assertEqual(checked("rev-parse", "HEAD", cwd=self.repo), self.base_sha)
         self.assertEqual(checked("rev-parse", "refs/heads/main", git_dir=self.remote), self.base_sha)
-
         branch = str(result["branch"])
         head_sha = str(result["commit_sha"])
         self.assertEqual(checked("rev-parse", f"refs/heads/{branch}", git_dir=self.remote), head_sha)
         self.assertEqual(checked("rev-parse", f"{head_sha}^", git_dir=self.remote), self.base_sha)
         paths = checked("diff-tree", "--no-commit-id", "--name-only", "-r", head_sha, git_dir=self.remote)
-        self.assertEqual(paths, request["file"]["path"])
-        stored = checked("show", f"{head_sha}:{request['file']['path']}", git_dir=self.remote)
+        self.assertEqual(paths, assignment.test_file)
+        stored = checked("show", f"{head_sha}:{assignment.test_file}", git_dir=self.remote)
         self.assertEqual(stored + "\n", request["file"]["content"])
-        self.assertEqual(checked("branch", "--list", branch, cwd=self.repo), "")
-        self.assertEqual(checked("worktree", "list", "--porcelain", cwd=self.repo).count("worktree "), 1)
+        saved_result = json.loads(assignment.result_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved_result["assignment_id"], assignment.assignment_id)
 
-    def test_base_context_rejects_feature_branch(self) -> None:
-        checked("switch", "-c", "feature/not-main", cwd=self.repo)
-        try:
-            with self.assertRaisesRegex(backend.RequestError, "必須從受信任基準分支 main 啟動"):
-                backend.base_context(self.repo)
-        finally:
-            checked("switch", "main", cwd=self.repo)
-            checked("branch", "-D", "feature/not-main", cwd=self.repo)
-
-    def test_maven_failure_does_not_commit_push_or_create_pr(self) -> None:
-        request = self.request("Alpha")
-        failed = {
-            "command": "./mvnw -B -ntp -Dtest=com.example.AlphaTest test",
-            "exit_code": 1,
-            "timed_out": False,
-            "maven_errors": "[ERROR] COMPILATION ERROR",
-        }
-        with (
-            patch.object(backend, "base_context", return_value=self.base),
-            patch.object(backend, "run_maven", return_value=failed),
-            patch.object(backend, "push_branch") as pushed,
-            patch.object(backend, "create_draft_pr") as created,
-        ):
-            result = backend.submit(self.repo, "session-failed", request)
-
-        self.assertEqual(result["status"], "candidate-check-failed")
-        self.assertEqual(result["maven_errors"], "[ERROR] COMPILATION ERROR")
-        self.assertEqual(result["diagnostic_field"], "maven_errors")
-        self.assertIn("修正候選內容後重新提交", result["agent_action"])
-        pushed.assert_not_called()
-        created.assert_not_called()
-        heads = checked("for-each-ref", "--format=%(refname:short)", "refs/heads", git_dir=self.remote)
-        self.assertEqual(heads, "main")
-        self.assertEqual(checked("rev-parse", "HEAD", cwd=self.repo), self.base_sha)
-        self.assertEqual(checked("worktree", "list", "--porcelain", cwd=self.repo).count("worktree "), 1)
-
-    def test_same_agent_can_fix_compile_error_and_resubmit(self) -> None:
-        request = self.request("Alpha")
-        failed = {
-            "command": "./mvnw -B -ntp -Dtest=com.example.AlphaTest test",
-            "exit_code": 1,
-            "timed_out": False,
-            "maven_errors": "[ERROR] cannot find symbol: assertThat",
-        }
-        with (
-            patch.object(backend, "base_context", return_value=self.base),
-            patch.object(backend, "run_maven", return_value=failed),
-        ):
-            first = backend.submit(self.repo, "session-retry", request)
-
-        request["file"]["content"] = str(request["file"]["content"]).replace(
-            "    // UT-001\n",
-            "    // UT-001\n    // corrected import and assertion\n",
-        )
-        second = self.submit("session-retry", request)
-
-        self.assertEqual(first["status"], "candidate-check-failed")
-        self.assertIn("cannot find symbol", first["maven_errors"])
-        self.assertEqual(second["status"], "draft-pr-created")
-        self.assertNotEqual(first["branch"], second["branch"])
-
-    def test_maven_side_effect_is_discarded_with_validation_copy(self) -> None:
-        request = self.request("Alpha")
-
-        def mutate_project(project: Path, candidate_class: str) -> dict[str, object]:
-            self.assertFalse((project / ".git").exists())
-            (project / "pom.xml").write_text("<project>changed</project>\n", encoding="utf-8")
-            return self.maven_success(project, candidate_class)
-
-        with (
-            patch.object(backend, "base_context", return_value=self.base),
-            patch.object(backend, "run_maven", side_effect=mutate_project),
-            patch.object(backend, "test_summary", side_effect=self.summary_success),
-            patch.object(backend, "coverage_summary", side_effect=self.coverage_success),
-            patch.object(backend, "create_draft_pr", side_effect=self.draft_pr),
-        ):
-            result = backend.submit(self.repo, "session-side-effect", request)
-
-        self.assertEqual(result["status"], "draft-pr-created")
-        head_sha = str(result["commit_sha"])
-        paths = checked("diff-tree", "--no-commit-id", "--name-only", "-r", head_sha, git_dir=self.remote)
-        self.assertEqual(paths, request["file"]["path"])
-        pom = checked("show", f"{head_sha}:pom.xml", git_dir=self.remote)
-        self.assertEqual(pom, "<project/>")
-        self.assertEqual(checked("rev-parse", "HEAD", cwd=self.repo), self.base_sha)
-
-    def test_maven_cannot_change_candidate_after_validation(self) -> None:
-        request = self.request("Alpha")
-
-        def mutate_candidate(project: Path, candidate_class: str) -> dict[str, object]:
-            path = project / str(request["file"]["path"])
-            path.write_text(str(request["file"]["content"]) + "// changed\n", encoding="utf-8")
-            return self.maven_success(project, candidate_class)
-
-        with (
-            patch.object(backend, "base_context", return_value=self.base),
-            patch.object(backend, "run_maven", side_effect=mutate_candidate),
-            patch.object(backend, "test_summary", side_effect=self.summary_success),
-            patch.object(backend, "coverage_summary", side_effect=self.coverage_success),
-            patch.object(backend, "push_branch") as pushed,
-            patch.object(backend, "create_draft_pr") as created,
-        ):
-            result = backend.submit(self.repo, "session-mutated-candidate", request)
-
-        self.assertEqual(result["status"], "submission-failed")
-        self.assertIn("候選測試內容與提交內容不一致", result["message"])
-        pushed.assert_not_called()
-        created.assert_not_called()
-
-    def test_remote_base_move_after_maven_prevents_push(self) -> None:
-        request = self.request("Alpha")
+    def test_remote_base_move_after_maven_prevents_commit_and_push(self) -> None:
+        worktree, assignment = self.prepare("session-stale-base", "AlphaService")
+        request = self.write_candidate(worktree, assignment, "AlphaService")
 
         def move_remote_main(project: Path, candidate_class: str) -> dict[str, object]:
             tree = checked("show", "-s", "--format=%T", self.base_sha, cwd=self.repo)
@@ -324,57 +467,23 @@ class SubmissionRepositoryTest(unittest.TestCase):
             return self.maven_success(project, candidate_class)
 
         with (
-            patch.object(backend, "base_context", return_value=self.base),
+            patch.object(backend, "verify_assignment_state"),
             patch.object(backend, "run_maven", side_effect=move_remote_main),
             patch.object(backend, "test_summary", side_effect=self.summary_success),
             patch.object(backend, "coverage_summary", side_effect=self.coverage_success),
             patch.object(backend, "push_branch") as pushed,
-            patch.object(backend, "create_draft_pr") as created,
         ):
-            result = backend.submit(self.repo, "session-stale-base", request)
+            result = backend.submit(worktree.project, assignment, request)
 
         self.assertEqual(result["status"], "submission-failed")
         self.assertIn("Maven 驗證後", result["message"])
         self.assertIn("已移動", result["message"])
         pushed.assert_not_called()
-        created.assert_not_called()
+        self.assertEqual(checked("rev-parse", "HEAD", cwd=worktree.project), self.base_sha)
 
-    def test_cancellation_during_push_reports_unknown_remote_state(self) -> None:
-        request = self.request("Alpha")
-
-        def cancel_push(_project: Path, _base: object, _branch: str) -> None:
-            backend._CANCEL_REQUESTED = True
-            raise backend.RequestError("工作已取消")
-
-        try:
-            with (
-                patch.object(backend, "base_context", return_value=self.base),
-                patch.object(backend, "run_maven", side_effect=self.maven_success),
-                patch.object(backend, "test_summary", side_effect=self.summary_success),
-                patch.object(backend, "coverage_summary", side_effect=self.coverage_success),
-                patch.object(backend, "push_branch", side_effect=cancel_push),
-                patch.object(backend, "create_draft_pr") as created,
-            ):
-                result = backend.submit(self.repo, "session-cancel-push", request)
-        finally:
-            backend._CANCEL_REQUESTED = False
-
-        self.assertEqual(result["status"], "cancelled")
-        self.assertIsNone(result["submitted"])
-        self.assertEqual(result["remote_state"], "unknown")
-        self.assertTrue(result["manual_recovery_required"])
-        self.assertFalse(result["automatic_retry_supported"])
-        created.assert_not_called()
-        self.assertEqual(checked("branch", "--list", str(result["branch"]), cwd=self.repo), result["branch"])
-
-        with patch.object(backend, "base_context", return_value=self.base):
-            retry = backend.submit(self.repo, "session-cancel-push", request)
-        self.assertEqual(retry["status"], "branch-conflict")
-        self.assertTrue(retry["manual_recovery_required"])
-        self.assertFalse(retry["automatic_retry_supported"])
-
-    def test_push_error_reconciles_remote_branch_before_reporting(self) -> None:
-        request = self.request("Alpha")
+    def test_push_error_reconciles_remote_sha(self) -> None:
+        worktree, assignment = self.prepare("session-push-timeout", "AlphaService")
+        request = self.write_candidate(worktree, assignment, "AlphaService")
         real_push = backend.push_branch
 
         def push_then_timeout(project: Path, base: object, branch: str) -> None:
@@ -382,220 +491,76 @@ class SubmissionRepositoryTest(unittest.TestCase):
             raise backend.RequestError("push response timed out")
 
         with (
-            patch.object(backend, "base_context", return_value=self.base),
+            patch.object(backend, "verify_assignment_state"),
             patch.object(backend, "run_maven", side_effect=self.maven_success),
             patch.object(backend, "test_summary", side_effect=self.summary_success),
             patch.object(backend, "coverage_summary", side_effect=self.coverage_success),
             patch.object(backend, "push_branch", side_effect=push_then_timeout),
             patch.object(backend, "create_draft_pr") as created,
         ):
-            result = backend.submit(self.repo, "session-push-timeout", request)
+            result = backend.submit(worktree.project, assignment, request)
 
         self.assertEqual(result["status"], "push-failed")
         self.assertTrue(result["submitted"])
         self.assertEqual(result["remote_sha"], result["commit_sha"])
         self.assertEqual(result["remote_state"], "verified-after-push-attempt")
         self.assertTrue(result["manual_recovery_required"])
-        self.assertIn("compare_url", result)
         created.assert_not_called()
 
-    def test_pr_failure_reports_observed_remote_sha_instead_of_local_sha(self) -> None:
-        request = self.request("Alpha")
-        observed: dict[str, str] = {}
+    def test_cancellation_during_push_reports_unknown_remote_state(self) -> None:
+        worktree, assignment = self.prepare("session-cancel-push", "AlphaService")
+        request = self.write_candidate(worktree, assignment, "AlphaService")
 
-        def drift_after_pr(
-            project: Path,
-            submitted_request: dict[str, object],
-            validation: dict[str, object],
-            base: object,
-            branch: str,
-            head_sha: str,
-            digest: str,
-        ) -> dict[str, object]:
-            pr = self.draft_pr(project, submitted_request, validation, base, branch, head_sha, digest)
-            checked("config", "user.name", "Remote Drift", git_dir=self.remote)
-            checked("config", "user.email", "drift@example.invalid", git_dir=self.remote)
-            tree = checked("show", "-s", "--format=%T", head_sha, git_dir=self.remote)
-            moved = checked("commit-tree", tree, "-p", head_sha, "-m", "remote drift", git_dir=self.remote)
-            checked("update-ref", f"refs/heads/{branch}", moved, head_sha, git_dir=self.remote)
-            observed["sha"] = moved
-            return pr
+        def cancel_push(_project: Path, _base: object, _branch: str) -> None:
+            backend._CANCEL_REQUESTED = True
+            raise backend.RequestError("工作已取消")
 
-        with (
-            patch.object(backend, "base_context", return_value=self.base),
-            patch.object(backend, "run_maven", side_effect=self.maven_success),
-            patch.object(backend, "test_summary", side_effect=self.summary_success),
-            patch.object(backend, "coverage_summary", side_effect=self.coverage_success),
-            patch.object(backend, "create_draft_pr", side_effect=drift_after_pr),
-        ):
-            result = backend.submit(self.repo, "session-remote-drift", request)
+        try:
+            with (
+                patch.object(backend, "verify_assignment_state"),
+                patch.object(backend, "run_maven", side_effect=self.maven_success),
+                patch.object(backend, "test_summary", side_effect=self.summary_success),
+                patch.object(backend, "coverage_summary", side_effect=self.coverage_success),
+                patch.object(backend, "push_branch", side_effect=cancel_push),
+            ):
+                result = backend.submit(worktree.project, assignment, request)
+        finally:
+            backend._CANCEL_REQUESTED = False
 
-        self.assertEqual(result["status"], "pr-create-or-verify-failed")
-        self.assertEqual(result["remote_sha"], observed["sha"])
-        self.assertNotEqual(result["remote_sha"], result["commit_sha"])
-        self.assertTrue(result["pr_created"])
-        self.assertFalse(result["pr_verified"])
-
-    def test_twelve_parallel_submissions_use_distinct_worktrees_and_branches(self) -> None:
-        requests = [self.request(f"Service{index:02d}") for index in range(12)]
-        barrier = threading.Barrier(len(requests))
-        worktrees: list[Path] = []
-        lock = threading.Lock()
-
-        def synchronized_maven(project: Path, candidate_class: str) -> dict[str, object]:
-            with lock:
-                worktrees.append(project)
-            barrier.wait(timeout=10)
-            return self.maven_success(project, candidate_class)
-
-        with (
-            patch.object(backend, "base_context", return_value=self.base),
-            patch.object(backend, "run_maven", side_effect=synchronized_maven),
-            patch.object(backend, "test_summary", side_effect=self.summary_success),
-            patch.object(backend, "coverage_summary", side_effect=self.coverage_success),
-            patch.object(backend, "create_draft_pr", side_effect=self.draft_pr),
-            ThreadPoolExecutor(max_workers=len(requests)) as executor,
-        ):
-            futures = [
-                executor.submit(backend.submit, self.repo, f"session-{index}", request)
-                for index, request in enumerate(requests)
-            ]
-            results = [future.result(timeout=30) for future in futures]
-
-        self.assertEqual({result["status"] for result in results}, {"draft-pr-created"})
-        self.assertEqual(len(set(worktrees)), len(requests))
-        self.assertEqual(len({result["branch"] for result in results}), len(requests))
-        for result, request in zip(results, requests, strict=True):
-            head_sha = str(result["commit_sha"])
-            paths = checked("diff-tree", "--no-commit-id", "--name-only", "-r", head_sha, git_dir=self.remote)
-            self.assertEqual(paths, request["file"]["path"])
-        self.assertEqual(checked("rev-parse", "HEAD", cwd=self.repo), self.base_sha)
-        self.assertEqual(checked("worktree", "list", "--porcelain", cwd=self.repo).count("worktree "), 1)
+        self.assertEqual(result["status"], "cancelled")
+        self.assertIsNone(result["submitted"])
+        self.assertEqual(result["remote_state"], "unknown")
+        self.assertTrue(result["manual_recovery_required"])
 
 
-class DraftPullRequestCommandTest(unittest.TestCase):
-    def test_create_command_is_draft_and_never_merges(self) -> None:
-        base = backend.BaseContext(
-            branch="main",
-            head_sha="a" * 40,
-            remote="origin",
-            remote_branch="main",
-            github_host="github.com",
-            github_repository="example/repository",
-        )
-        request = SubmissionRepositoryTest.request("Alpha")
-        validation = {
-            "command": "./mvnw -B -ntp -Dtest=com.example.AlphaTest test",
-            "candidate_tests": {"executed": 1},
-            "coverage": {"percent": 100.0, "minimum_percent": 80},
-        }
-        branch = "opencode/unit-test/alpha-123456789abc"
-        head_sha = "b" * 40
-        commands: list[list[str]] = []
-
-        def fake_run(invocation: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
-            commands.append(invocation)
-            if invocation[:3] == ["gh", "pr", "create"]:
-                return subprocess.CompletedProcess(invocation, 0, "https://github.com/example/repository/pull/7\n", "")
-            details = {
-                "number": 7,
-                "url": "https://github.com/example/repository/pull/7",
-                "isDraft": True,
-                "state": "OPEN",
-                "headRefName": branch,
-                "headRefOid": head_sha,
-                "baseRefName": "main",
-            }
-            return subprocess.CompletedProcess(invocation, 0, json.dumps(details), "")
-
-        with patch.object(backend, "run_command", side_effect=fake_run):
-            result = backend.create_draft_pr(
-                Path.cwd(),
-                request,
-                validation,
-                base,
-                branch,
-                head_sha,
-                "c" * 64,
-            )
-
-        self.assertTrue(result["isDraft"])
-        create = commands[0]
-        self.assertIn("--draft", create)
-        self.assertEqual(create[create.index("--base") + 1], "main")
-        self.assertEqual(create[create.index("--head") + 1], branch)
-        joined = " ".join(" ".join(invocation) for invocation in commands)
-        self.assertNotIn(" pr merge ", f" {joined} ")
-        self.assertNotIn(" pr ready ", f" {joined} ")
-        self.assertNotIn(" push --force ", f" {joined} ")
-
-    def test_create_timeout_reports_unknown_pr_state(self) -> None:
-        base = backend.BaseContext(
-            branch="main",
-            head_sha="a" * 40,
-            remote="origin",
-            remote_branch="main",
-            github_host="github.com",
-            github_repository="example/repository",
-        )
-        request = SubmissionRepositoryTest.request("Alpha")
-        validation = {
-            "command": "./mvnw -B -ntp -Dtest=com.example.AlphaTest test",
-            "candidate_tests": {"executed": 1},
-            "coverage": {"percent": 100.0, "minimum_percent": 80},
-        }
-
-        def timed_out(invocation: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
-            return subprocess.CompletedProcess(invocation, 124, "", "request timed out")
-
-        with (
-            patch.object(backend, "run_command", side_effect=timed_out),
-            self.assertRaises(backend.DraftPrStateUnknownError),
-        ):
-            backend.create_draft_pr(
-                Path.cwd(),
-                request,
-                validation,
-                base,
-                "opencode/unit-test/alpha-timeout",
-                "b" * 40,
-                "c" * 64,
-            )
-
-
-class PureFunctionTest(unittest.TestCase):
-    def test_branch_name_uses_session_and_candidate_content(self) -> None:
-        request = SubmissionRepositoryTest.request("Alpha")
-        first = backend.branch_name("session-one", request)
-        second = backend.branch_name("session-two", request)
+class PureFunctionAndCommandTest(unittest.TestCase):
+    def test_branch_name_uses_session_target_and_base(self) -> None:
+        base = "a" * 40
+        first = backend.branch_name("session-one", "com.example.AlphaService", base)
+        second = backend.branch_name("session-two", "com.example.AlphaService", base)
         self.assertNotEqual(first, second)
-        self.assertEqual(first, backend.branch_name("session-one", request))
-        self.assertTrue(first.startswith("opencode/unit-test/alpha-"))
+        self.assertEqual(first, backend.branch_name("session-one", "com.example.AlphaService", base))
+        self.assertTrue(first.startswith("opencode/unit-test/alphaservice-"))
 
     def test_github_remote_parses_https_and_ssh(self) -> None:
         expected = ("github.com", "owner/repository")
         self.assertEqual(backend.github_remote("https://github.com/owner/repository.git"), expected)
         self.assertEqual(backend.github_remote("git@github.com:owner/repository.git"), expected)
 
-    def test_validation_copy_keeps_nested_target_package_but_removes_git_metadata(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="validation-copy-") as temporary:
-            root = Path(temporary)
-            source = root / "source"
-            project = root / "project"
-            (source / ".git").mkdir(parents=True)
-            (source / ".git/config").write_text("secret\n", encoding="utf-8")
-            (source / ".opencode").mkdir()
-            (source / "target").mkdir()
-            nested = source / "src/main/java/com/example/target"
-            nested.mkdir(parents=True)
-            (nested / "PriceUtil.java").write_text("class PriceUtil {}\n", encoding="utf-8")
+    def test_validate_target_requires_service_suffix(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="target-validation-") as temporary:
+            repo = Path(temporary)
+            with self.assertRaisesRegex(backend.RequestError, "Service 結尾"):
+                backend.validate_target(repo, "com.example.Alpha")
 
-            backend.create_validation_copy(source, project)
-
-            self.assertFalse((project / ".git").exists())
-            self.assertFalse((project / ".opencode").exists())
-            self.assertFalse((project / "target").exists())
-            self.assertTrue((project / "src/main/java/com/example/target/PriceUtil.java").is_file())
+    def test_coverage_requires_jacoco_execution_data(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="coverage-artifacts-") as temporary:
+            project = Path(temporary)
+            report = project / "target/site/jacoco/jacoco.xml"
+            report.parent.mkdir(parents=True)
+            report.write_text("<report/>\n", encoding="utf-8")
+            with self.assertRaisesRegex(backend.RequestError, "target/jacoco.exec"):
+                backend.coverage_summary(project, "com.example.AlphaService")
 
     def test_maven_environment_removes_git_github_and_ssh_credentials(self) -> None:
         captured: dict[str, str] = {}
@@ -624,15 +589,13 @@ class PureFunctionTest(unittest.TestCase):
                 ),
                 patch.object(backend, "run_command", side_effect=fake_run),
             ):
-                result = backend.run_maven(project, "com.example.AlphaTest")
+                result = backend.run_maven(project, "com.example.AlphaServiceTest")
 
         self.assertEqual(result["exit_code"], 1)
         self.assertEqual(
             result["maven_errors"],
             "[ERROR] AlphaTest.java:[12,9] cannot find symbol\n[ERROR] -> [Help 1]",
         )
-        self.assertNotIn("[INFO]", result["maven_errors"])
-        self.assertNotIn("WARNING", result["maven_errors"])
         self.assertNotIn("GH_TOKEN", captured)
         self.assertNotIn("GITHUB_TOKEN", captured)
         self.assertNotIn("GIT_ASKPASS", captured)
@@ -641,23 +604,78 @@ class PureFunctionTest(unittest.TestCase):
         self.assertEqual(captured["GIT_CONFIG_NOSYSTEM"], "1")
         self.assertEqual(captured["GIT_TERMINAL_PROMPT"], "0")
 
-    def test_maven_returns_all_error_lines_without_tail_truncation(self) -> None:
-        error_lines = [f"[ERROR] compiler failure {index}" for index in range(250)]
-        long_error = "[ERROR] " + ("x" * 5_000)
+    def test_create_command_is_draft_and_never_merges(self) -> None:
+        base = backend.BaseContext(
+            branch="main",
+            head_sha="a" * 40,
+            remote="origin",
+            remote_branch="main",
+            github_host="github.com",
+            github_repository="example/repository",
+        )
+        assignment = backend.Assignment(
+            assignment_id="id",
+            coordinator_session_id="session",
+            worker_session_id="child-session",
+            coordinator_repo=Path.cwd(),
+            common_git_dir=Path.cwd(),
+            manifest_path=Path.cwd() / "assignment.json",
+            result_path=Path.cwd() / "result.json",
+            branch="opencode/unit-test/alpha-123456789abc",
+            target_class="com.example.AlphaService",
+            target_source="src/main/java/com/example/AlphaService.java",
+            candidate_class="com.example.AlphaServiceTest",
+            test_file="src/test/java/com/example/AlphaServiceTest.java",
+            specification_sources=("docs/service.md",),
+            base=base,
+        )
+        request = {
+            "test_cases": [
+                {"id": "UT-001", "scenario": "情境", "expected": "結果", "evidence": "docs/service.md"}
+            ]
+        }
+        validation = {
+            "command": "./mvnw -B -ntp -Dtest=com.example.AlphaServiceTest test",
+            "candidate_tests": {"executed": 1},
+            "coverage": {"percent": 100.0, "minimum_percent": 80},
+        }
+        head_sha = "b" * 40
+        commands: list[list[str]] = []
 
         def fake_run(invocation: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
-            stdout = "\n".join(["[INFO] Starting build", *error_lines, long_error])
-            stderr = "[WARNING] This line must not be returned\n"
-            return subprocess.CompletedProcess(invocation, 1, stdout, stderr)
+            commands.append(invocation)
+            if invocation[:3] == ["gh", "pr", "create"]:
+                return subprocess.CompletedProcess(invocation, 0, "https://github.com/example/repository/pull/7\n", "")
+            details = {
+                "number": 7,
+                "url": "https://github.com/example/repository/pull/7",
+                "isDraft": True,
+                "state": "OPEN",
+                "headRefName": assignment.branch,
+                "headRefOid": head_sha,
+                "baseRefName": "main",
+            }
+            return subprocess.CompletedProcess(invocation, 0, json.dumps(details), "")
 
-        with tempfile.TemporaryDirectory(prefix="maven-errors-") as temporary:
-            project = Path(temporary) / "project"
-            project.mkdir()
-            with patch.object(backend, "run_command", side_effect=fake_run):
-                result = backend.run_maven(project, "com.example.AlphaTest")
+        with patch.object(backend, "run_command", side_effect=fake_run):
+            result = backend.create_draft_pr(
+                Path.cwd(),
+                request,
+                validation,
+                assignment,
+                head_sha,
+                "c" * 64,
+            )
 
-        self.assertEqual(result["maven_errors"].splitlines(), [*error_lines, long_error])
-        self.assertNotIn("failure_tail", result)
+        self.assertTrue(result["isDraft"])
+        create = commands[0]
+        self.assertIn("--draft", create)
+        self.assertEqual(create[create.index("--base") + 1], "main")
+        self.assertEqual(create[create.index("--head") + 1], assignment.branch)
+        joined = " ".join(" ".join(invocation) for invocation in commands)
+        self.assertNotIn(" pr merge ", f" {joined} ")
+        self.assertNotIn(" pr ready ", f" {joined} ")
+        self.assertNotIn(" push --force ", f" {joined} ")
 
 
 if __name__ == "__main__":

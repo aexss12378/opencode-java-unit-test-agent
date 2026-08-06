@@ -3,7 +3,9 @@
   "default_agent": "unit-test-orchestrator",
   "permission": {
     "external_directory": "deny",
+    "dispatch_unit_tests": "deny",
     "javadoc_edit": "deny",
+    "validate_unit_tests": "deny",
     "submit_unit_tests": "deny"
   }
 }
