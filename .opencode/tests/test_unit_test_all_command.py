@@ -45,6 +45,7 @@ class UnitTestAllCommandTest(unittest.TestCase):
         self.assertIn("`max_concurrency: 2`", text)
         self.assertIn("缺少可信規格證據", text)
         self.assertIn("沒有公開 Javadoc 的正式原始碼不是規格來源", text)
+        self.assertIn("檔案來源每一項只能傳入純檔案路徑", text)
         self.assertIn("工具會自行盤點 Service", text)
 
     def test_worker_can_validate_but_cannot_submit(self) -> None:

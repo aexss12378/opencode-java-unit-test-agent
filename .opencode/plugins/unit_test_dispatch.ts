@@ -7,7 +7,7 @@ const sourceText = tool.schema
   .min(1)
   .max(4000)
   .describe(
-    "實際存在的 README、docs、src/main/resources、目標類別公開 Javadoc 檔案位置，或以「使用者需求：」開頭的目前對話明確需求",
+    "實際存在的 README、docs、src/main/resources、目標類別公開 Javadoc 純檔案路徑，或以「使用者需求：」開頭的目前對話明確需求；檔案路徑不得附加行號、Javadoc 字樣或其他說明",
   )
 
 export const UnitTestDispatchPlugin: Plugin = async ({ client }) => ({

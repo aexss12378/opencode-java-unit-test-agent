@@ -37,7 +37,7 @@ permission:
 - 每次任務開始先載入一次 `springboot-java-unit-testing` Skill。全專案請求時只執行其中的「專案範圍盤點」；不得自行設計測試案例或預期結果。
 - 不得使用內建 `task`。`dispatch_unit_tests` 會透過 OpenCode 提供的 Session client，以目前工作階段作為 `parentID`，並將每個 Service 的 worktree 設為該子工作階段的 `directory`。
 - 每個派工目標只能包含一個以 `Service` 結尾的完整類別名稱，以及已確認的可信規格來源。不得替工作代理編造、推定或傳入未經證據支持的預期結果。
-- `specification_sources` 只能使用實際存在的 `README*`、`docs/**`、`src/main/resources/**`、目標類別的公開 Javadoc，或以「使用者需求：」開頭的目前對話明確需求。沒有公開 Javadoc 的正式原始碼不是規格來源。
+- `specification_sources` 只能使用實際存在的 `README*`、`docs/**`、`src/main/resources/**`、目標類別的公開 Javadoc，或以「使用者需求：」開頭的目前對話明確需求。檔案來源每一項只能傳入純檔案路徑，不得附加行號、`Javadoc` 字樣或其他說明；沒有公開 Javadoc 的正式原始碼不是規格來源。
 - 一個 Service 固定對應一個本機分支、一個 worktree 與一個測試檔。驗證完成後保留本機分支與 worktree 供工程師檢查。
 - 全專案盤點完成後，必須先取得工程師確認建議範圍，才可呼叫 `dispatch_unit_tests`。工程師明確指定單一 Service 時，該類別視為已確認範圍；符合下節全部條件的 `/unit-test-all` 預先授權批次模式是唯一例外。
 - 目前是只驗證模式；不得提交、推送任何分支、建立 PR，或宣稱測試已進入 `main`。
