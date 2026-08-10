@@ -82,7 +82,7 @@ export default tool({
           id: tool.schema.string().trim().regex(/^UT-[0-9]{3,}$/),
           scenario: caseText("測試情境、輸入與前置條件"),
           expected: caseText("可觀察的預期結果"),
-          evidence: caseText("可信規格檔案位置或工程師明確需求"),
+          evidence: caseText("外部規格位置，或以「目前實作：」標示的行為依據"),
         }),
       )
       .min(1)

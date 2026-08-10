@@ -32,7 +32,7 @@ class UnitTestAllCommandTest(unittest.TestCase):
         self.assertEqual(metadata["agent"], "unit-test-orchestrator")
         self.assertEqual(metadata["subtask"], "false")
         self.assertIn("unit-test-all/v2", text)
-        self.assertIn("一次觸發所有可執行 Service 的子代理", text)
+        self.assertIn("一次觸發所有 Service 的子代理", text)
         self.assertIn("提交、推送並建立 Draft PR", text)
         self.assertIn("本次不執行清理", text)
 
@@ -51,6 +51,8 @@ class UnitTestAllCommandTest(unittest.TestCase):
         self.assertIn("每個項目恰好呼叫一次", text)
         self.assertIn("同時送出全部 Task 呼叫", text)
         self.assertIn("不得分批", text)
+        self.assertIn("每個 Service 都必須正好出現在 `targets` 一次", text)
+        self.assertNotIn("完整 `not_started`", text)
         self.assertNotIn("max_concurrency", text)
 
     def test_all_service_dispatch_has_no_concurrency_cap(self) -> None:
@@ -61,7 +63,14 @@ class UnitTestAllCommandTest(unittest.TestCase):
 
         self.assertNotIn("max_concurrency", sources)
         self.assertNotIn("每批", sources)
-        self.assertIn("一次觸發所有可執行 Service", sources)
+        self.assertIn("一次觸發所有 Service", sources)
+
+    def test_prepare_schema_only_accepts_optional_specification_paths(self) -> None:
+        text = PREPARE_TOOL.read_text(encoding="utf-8")
+
+        self.assertIn(".regex(/^(?:README", text)
+        self.assertIn(".optional()", text)
+        self.assertNotIn("not_started", text)
 
     def test_worker_can_edit_nested_tests_validate_and_publish(self) -> None:
         text = UNIT_TEST_AGENT.read_text(encoding="utf-8")

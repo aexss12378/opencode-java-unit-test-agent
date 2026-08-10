@@ -109,21 +109,12 @@ class UnitTestWorkflowTest(unittest.TestCase):
         self,
         *,
         targets: list[dict[str, object]] | None = None,
-        not_started: list[dict[str, str]] | None = None,
     ) -> dict[str, object]:
         return {
             "execution_mode": "unit-test-all/v2",
             "targets": targets
             if targets is not None
-            else [self.target("AlphaService")],
-            "not_started": not_started
-            if not_started is not None
-            else [
-                {
-                    "target_class": "com.example.BetaService",
-                    "reason": "缺少可信規格證據",
-                }
-            ],
+            else [self.target("AlphaService"), self.target("BetaService")],
         }
 
     @staticmethod
@@ -179,10 +170,7 @@ class UnitTestWorkflowTest(unittest.TestCase):
     def prepare_all(self) -> dict[str, object]:
         request = prepare.validate_request(
             self.repo,
-            self.request(
-                targets=[self.target("AlphaService"), self.target("BetaService")],
-                not_started=[],
-            ),
+            self.request(),
         )
         with patch.object(prepare, "base_context", return_value=self.base):
             result = prepare.prepare(self.repo, "coordinator-1", request)
@@ -226,9 +214,9 @@ class UnitTestWorkflowTest(unittest.TestCase):
         ):
             return validate.validate(assignment, {"test_cases": self.cases()})
 
-    def test_prepare_requires_complete_service_classification(self) -> None:
-        incomplete = self.request(targets=[self.target("AlphaService")], not_started=[])
-        with self.assertRaisesRegex(common.RequestError, "未分類.*BetaService"):
+    def test_prepare_requires_every_service_in_dispatch_list(self) -> None:
+        incomplete = self.request(targets=[self.target("AlphaService")])
+        with self.assertRaisesRegex(common.RequestError, "派工清單不完整.*BetaService"):
             prepare.validate_request(self.repo, incomplete)
 
     def test_prepare_creates_visible_worktree_and_one_branch_per_service(self) -> None:
@@ -248,29 +236,56 @@ class UnitTestWorkflowTest(unittest.TestCase):
             self.assertIn("publish_unit_test", item["prompt"])
         self.assertEqual(checked("status", "--porcelain", cwd=self.repo), "")
 
-    def test_prepare_accepts_every_service_as_not_started(self) -> None:
+    def test_prepare_accepts_services_without_external_specs(self) -> None:
         request = prepare.validate_request(
             self.repo,
             self.request(
-                targets=[],
-                not_started=[
-                    {
-                        "target_class": "com.example.AlphaService",
-                        "reason": "缺少可信規格證據",
-                    },
-                    {
-                        "target_class": "com.example.BetaService",
-                        "reason": "可信規格彼此衝突",
-                    },
+                targets=[
+                    {"target_class": "com.example.AlphaService"},
+                    {"target_class": "com.example.BetaService"},
                 ],
             ),
         )
         with patch.object(prepare, "base_context", return_value=self.base):
             result = prepare.prepare(self.repo, "coordinator-2", request)
+        self.prepared.extend(result["prepared"])
 
         self.assertEqual(result["status"], "prepared")
-        self.assertEqual(result["prepared"], [])
-        self.assertEqual(len(result["results"]), 2)
+        self.assertEqual(len(result["prepared"]), 2)
+        self.assertEqual(result["results"], [])
+        for item in result["prepared"]:
+            self.assertIn("外部規格檔案：\n- 無", item["prompt"])
+            self.assertIn("目前可觀察行為建立測試", item["prompt"])
+
+    def test_prepare_rejects_non_path_text_as_external_spec_path(self) -> None:
+        request = self.request(
+            targets=[
+                {
+                    "target_class": "com.example.AlphaService",
+                    "specification_sources": ["AlphaService 的規格文字"],
+                },
+                {"target_class": "com.example.BetaService"},
+            ]
+        )
+
+        with self.assertRaisesRegex(common.RequestError, "外部規格"):
+            prepare.validate_request(self.repo, request)
+
+    def test_prepare_rejects_service_source_as_external_spec_path(self) -> None:
+        request = self.request(
+            targets=[
+                {
+                    "target_class": "com.example.AlphaService",
+                    "specification_sources": [
+                        "src/main/java/com/example/AlphaService.java"
+                    ],
+                },
+                {"target_class": "com.example.BetaService"},
+            ]
+        )
+
+        with self.assertRaisesRegex(common.RequestError, "只允許 README、docs"):
+            prepare.validate_request(self.repo, request)
 
     def test_validation_binds_exact_worker_and_writes_receipt(self) -> None:
         item = self.prepare_all()["prepared"][0]

@@ -24,7 +24,6 @@ MAX_FILE_BYTES = 100_000
 MAX_TARGETS = 50
 TRUSTED_BASE_BRANCH = "main"
 BATCH_EXECUTION_MODE = "unit-test-all/v2"
-NOT_STARTED_REASONS = {"缺少可信規格證據", "可信規格彼此衝突"}
 
 ASSIGNMENT_ID = re.compile(r"^[0-9a-f]{24}$")
 CASE_ID = re.compile(r"^UT-[0-9]{3,}$")
@@ -571,12 +570,10 @@ def load_assignment(
     if not worktree.is_relative_to(allowed_root) or worktree == allowed_root:
         raise RequestError("派工工作樹不在 unit-test-worktrees 內")
     raw_sources = data.get("specification_sources")
-    if (
-        not isinstance(raw_sources, list)
-        or not raw_sources
-        or any(not isinstance(item, str) for item in raw_sources)
+    if not isinstance(raw_sources, list) or any(
+        not isinstance(item, str) for item in raw_sources
     ):
-        raise RequestError("派工狀態缺少可信規格來源")
+        raise RequestError("派工狀態的外部規格格式無效")
     assignment = Assignment(
         assignment_id=assignment_id,
         coordinator_session_id=data["coordinator_session_id"],

@@ -1,4 +1,4 @@
-"""盤點所有具體 Service，並為可執行項目建立可見的獨立工作樹。"""
+"""盤點所有具體 Service，並為每個 Service 建立可見的獨立工作樹。"""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from _unit_test_common import (
     ASSIGNMENT_VERSION,
     BATCH_EXECUTION_MODE,
     MAX_TARGETS,
-    NOT_STARTED_REASONS,
     BaseContext,
     BranchConflictError,
     RequestError,
@@ -43,10 +42,6 @@ PACKAGE = re.compile(
 )
 JAVA_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 JAVA_LINE_COMMENT = re.compile(r"//[^\r\n]*")
-PUBLIC_JAVADOC = re.compile(
-    r"/\*\*.*?\*/\s*(?:(?:@[A-Za-z_$][\w$]*(?:\([^)]*\))?)\s*)*(?:public|protected)\s+",
-    re.DOTALL,
-)
 
 
 def discover_concrete_services(repo: Path) -> list[str]:
@@ -82,49 +77,28 @@ def discover_concrete_services(repo: Path) -> list[str]:
     return sorted(discovered)
 
 
-def normalize_specification_source(
-    repo: Path, target: dict[str, str], value: str
-) -> str:
+def normalize_specification_source(repo: Path, target_class: str, value: str) -> str:
     source = value.strip()
-    if source.startswith("使用者需求："):
-        requirement = source.removeprefix("使用者需求：").strip()
-        if not requirement:
-            raise RequestError(f"{target['target_class']} 的使用者需求不得為空")
-        return f"使用者需求：{requirement}"
     candidate = Path(source)
-    source_path = candidate if candidate.is_absolute() else repo / candidate
+    if candidate.is_absolute():
+        raise RequestError(f"{target_class} 的外部規格必須使用專案相對路徑：{source}")
+    source_path = repo / candidate
     resolved = source_path.resolve()
     try:
         relative = resolved.relative_to(repo.resolve())
     except ValueError as exc:
-        raise RequestError(
-            f"{target['target_class']} 的規格來源離開專案範圍：{source}"
-        ) from exc
+        raise RequestError(f"{target_class} 的外部規格離開專案範圍：{source}") from exc
     if source_path.is_symlink() or not resolved.is_file():
-        raise RequestError(
-            f"{target['target_class']} 的規格來源不存在或不是一般檔案：{source}"
-        )
+        raise RequestError(f"{target_class} 的外部規格不存在或不是一般檔案：{source}")
     relative_text = relative.as_posix()
     allowed_document = (
         (len(relative.parts) == 1 and relative.name.lower().startswith("readme"))
         or relative.parts[:1] == ("docs",)
         or relative.parts[:3] == ("src", "main", "resources")
     )
-    if relative_text == target["target_source"]:
-        try:
-            content = resolved.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as exc:
-            raise RequestError(
-                f"無法讀取 {target['target_class']} 的 Javadoc 規格來源"
-            ) from exc
-        if PUBLIC_JAVADOC.search(content) is None:
-            raise RequestError(
-                f"{target['target_class']} 的正式原始碼沒有公開 Javadoc，不得當成可信規格來源"
-            )
-    elif not allowed_document:
+    if not allowed_document:
         raise RequestError(
-            f"{target['target_class']} 的規格來源只允許 README、docs、src/main/resources、"
-            "目標類別公開 Javadoc 或「使用者需求：...」"
+            f"{target_class} 的外部規格只允許 README、docs 或 src/main/resources"
         )
     return relative_text
 
@@ -133,11 +107,8 @@ def validate_request(repo: Path, data: dict[str, Any]) -> dict[str, Any]:
     if data.get("execution_mode") != BATCH_EXECUTION_MODE:
         raise RequestError(f"execution_mode 必須是 {BATCH_EXECUTION_MODE}")
     raw_targets = data.get("targets")
-    raw_not_started = data.get("not_started")
     if not isinstance(raw_targets, list) or len(raw_targets) > MAX_TARGETS:
         raise RequestError(f"targets 必須是最多 {MAX_TARGETS} 項的陣列")
-    if not isinstance(raw_not_started, list) or len(raw_not_started) > MAX_TARGETS:
-        raise RequestError(f"not_started 必須是最多 {MAX_TARGETS} 項的陣列")
 
     seen: set[str] = set()
     targets: list[dict[str, Any]] = []
@@ -149,51 +120,30 @@ def validate_request(repo: Path, data: dict[str, Any]) -> dict[str, Any]:
             raise RequestError(f"Service 不得重複：{target_class}")
         seen.add(target_class)
         target = validate_target(repo, target_class)
-        raw_sources = raw.get("specification_sources")
-        if not isinstance(raw_sources, list) or not 1 <= len(raw_sources) <= 20:
-            raise RequestError(f"{target_class} 必須提供 1 到 20 個可信規格來源")
+        raw_sources = raw.get("specification_sources", [])
+        if not isinstance(raw_sources, list) or len(raw_sources) > 20:
+            raise RequestError(f"{target_class} 的外部規格必須是最多 20 個檔案路徑")
         sources: list[str] = []
         for value in raw_sources:
-            if not isinstance(value, str) or not value.strip() or len(value) > 4_000:
-                raise RequestError(f"{target_class} 的可信規格來源格式無效")
-            sources.append(normalize_specification_source(repo, target, value))
+            if not isinstance(value, str) or not value.strip() or len(value) > 500:
+                raise RequestError(f"{target_class} 的外部規格路徑格式無效")
+            sources.append(normalize_specification_source(repo, target_class, value))
         targets.append({**target, "specification_sources": sources})
 
-    not_started: list[dict[str, str]] = []
-    for raw in raw_not_started:
-        if not isinstance(raw, dict):
-            raise RequestError("每個 not_started 項目都必須是物件")
-        target_class = parse_required_string(raw, "target_class")
-        reason = raw.get("reason")
-        if target_class in seen:
-            raise RequestError(f"Service 不得同時派工與未開始：{target_class}")
-        if reason not in NOT_STARTED_REASONS:
-            raise RequestError(f"{target_class} 的未開始原因不在允許清單")
-        target = validate_target(repo, target_class)
-        seen.add(target_class)
-        not_started.append(
-            {
-                "target_class": target_class,
-                "test_file": target["test_file"],
-                "reason": reason,
-            }
-        )
-
     discovered = discover_concrete_services(repo)
-    classified = sorted(seen)
-    if classified != discovered:
-        missing = sorted(set(discovered) - set(classified))
-        unexpected = sorted(set(classified) - set(discovered))
+    requested = sorted(seen)
+    if requested != discovered:
+        missing = sorted(set(discovered) - set(requested))
+        unexpected = sorted(set(requested) - set(discovered))
         details: list[str] = []
         if missing:
-            details.append("未分類：" + ", ".join(missing))
+            details.append("缺少：" + ", ".join(missing))
         if unexpected:
             details.append("不在固定範圍：" + ", ".join(unexpected))
-        raise RequestError("全部 Service 的分類不完整；" + "；".join(details))
+        raise RequestError("全部 Service 的派工清單不完整；" + "；".join(details))
     return {
         "execution_mode": BATCH_EXECUTION_MODE,
         "targets": sorted(targets, key=lambda item: item["target_class"]),
-        "not_started": sorted(not_started, key=lambda item: item["target_class"]),
         "target_order": discovered,
     }
 
@@ -244,7 +194,10 @@ def worker_prompt(repo: Path, worktree: Path, state: dict[str, Any]) -> str:
     relative_worktree = worktree.relative_to(repo).as_posix()
     source_path = f"{relative_worktree}/{state['target_source']}"
     test_path = f"{relative_worktree}/{state['test_file']}"
-    sources = "\n".join(f"- {source}" for source in state["specification_sources"])
+    sources = state["specification_sources"]
+    external_specs = (
+        "\n".join(f"- {source}" for source in sources) if sources else "- 無"
+    )
     return (
         f"execution_mode: {BATCH_EXECUTION_MODE}\n"
         f"assignment_id: {state['assignment_id']}\n"
@@ -252,8 +205,10 @@ def worker_prompt(repo: Path, worktree: Path, state: dict[str, Any]) -> str:
         f"worktree_path: {relative_worktree}\n"
         f"target_source_path: {source_path}\n"
         f"test_file_path: {test_path}\n"
-        "可信規格來源：\n"
-        f"{sources}\n\n"
+        "外部規格檔案：\n"
+        f"{external_specs}\n\n"
+        "有外部規格時以規格為準；沒有時依目前可觀察行為建立測試，"
+        "並在 evidence 標示目前實作依據。\n\n"
         "只處理這一個 Service。先獨立整理案例的 scenario、expected、evidence，再用 edit 修改唯一的 "
         f"test_file_path。完成後呼叫 validate_unit_test；通過後立即呼叫 publish_unit_test。"
         "不得修改正式原始碼、pom.xml 或其他測試檔。"
@@ -347,16 +302,7 @@ def prepare(repo: Path, session_id: str, request: dict[str, Any]) -> dict[str, A
     if ignored.returncode != 0:
         raise RequestError(".gitignore 必須排除 unit-test-worktrees/")
     prepared: list[dict[str, Any]] = []
-    failures: list[dict[str, Any]] = [
-        {
-            "status": "not-started",
-            **item,
-            "submitted": False,
-            "pr_created": False,
-            "merged": False,
-        }
-        for item in request["not_started"]
-    ]
+    failures: list[dict[str, Any]] = []
     for target in request["targets"]:
         try:
             require_remote_sha(
@@ -388,9 +334,7 @@ def prepare(repo: Path, session_id: str, request: dict[str, Any]) -> dict[str, A
     return {
         "status": status,
         "message": (
-            f"{len(prepared)} 個 Service 工作樹已準備；"
-            f"{len(request['not_started'])} 個因規格原因未開始；"
-            f"{len(failures) - len(request['not_started'])} 個建立失敗。"
+            f"{len(prepared)} 個 Service 工作樹已準備；{len(failures)} 個建立失敗。"
         ),
         "execution_mode": request["execution_mode"],
         "base_branch": base.remote_branch,

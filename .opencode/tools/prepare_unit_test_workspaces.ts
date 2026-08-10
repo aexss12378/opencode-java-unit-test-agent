@@ -72,27 +72,23 @@ const specificationSource = tool.schema
   .string()
   .trim()
   .min(1)
-  .max(4000)
-  .describe("可信規格檔案路徑，或以「使用者需求：」開頭的明確需求")
+  .max(500)
+  .regex(/^(?:README[^/]*|docs\/.+|src\/main\/resources\/.+)$/i)
+  .describe("選填的外部規格檔案路徑；只接受 README、docs 或 src/main/resources")
 
 export default tool({
   description:
-    "完整核對所有具體 Service 的分類，再為每個可執行 Service 建立獨立分支與專案內可見工作樹。只準備派工，不撰寫、驗證或發布測試。",
+    "完整核對所有具體 Service，再為每個 Service 建立獨立分支與專案內可見工作樹。外部規格可省略；只準備派工，不撰寫、驗證或發布測試。",
   args: {
     execution_mode: tool.schema.literal("unit-test-all/v2"),
     targets: tool.schema
       .array(
         tool.schema.object({
           target_class: tool.schema.string().trim().min(1),
-          specification_sources: tool.schema.array(specificationSource).min(1).max(20),
-        }),
-      )
-      .max(50),
-    not_started: tool.schema
-      .array(
-        tool.schema.object({
-          target_class: tool.schema.string().trim().min(1),
-          reason: tool.schema.enum(["缺少可信規格證據", "可信規格彼此衝突"]),
+          specification_sources: tool.schema
+            .array(specificationSource)
+            .max(20)
+            .optional(),
         }),
       )
       .max(50),
