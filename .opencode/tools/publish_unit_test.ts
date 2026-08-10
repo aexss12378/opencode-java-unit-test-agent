@@ -70,7 +70,7 @@ async function runBackend(
 
 export default tool({
   description:
-    "只發布最新 validate_unit_test 憑證綁定的候選測試。工具會提交、推送、建立 Draft PR，並核對推送結果與新建 PR；不會重試、轉為 Ready、合併或清理工作樹。",
+    "只發布最新 validate_unit_test 憑證綁定的候選測試。工具會提交、推送並建立 Draft PR；不會重試、轉為 Ready、合併或清理工作樹。",
   args: {
     assignment_id: tool.schema.string().regex(/^[0-9a-f]{24}$/),
     validation_id: tool.schema.string().regex(/^[0-9a-f]{24}$/),

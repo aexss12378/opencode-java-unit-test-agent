@@ -353,35 +353,24 @@ class UnitTestWorkflowTest(unittest.TestCase):
         self.write_candidate(assignment)
         validation_result = self.validate_candidate(assignment)
         assignment = self.load_worker(item)
-        draft = {
-            "number": 7,
-            "url": "https://github.com/example/repository/pull/7",
-            "isDraft": True,
-            "state": "OPEN",
-            "headRefName": assignment.branch,
-            "headRefOid": "filled-by-test",
-            "baseRefName": "main",
-        }
-
-        def fake_pr(
-            _assignment: common.Assignment,
-            _receipt: dict[str, object],
-            commit_sha: str,
-        ) -> dict[str, object]:
-            return {**draft, "headRefOid": commit_sha}
-
         with (
             patch.object(
                 common,
                 "github_remote",
                 return_value=("github.com", "example/repository"),
             ),
-            patch.object(publish, "create_draft_pr", side_effect=fake_pr),
+            patch.object(
+                publish,
+                "create_draft_pr",
+                return_value="https://github.com/example/repository/pull/7",
+            ),
         ):
             result = publish.publish(assignment, validation_result["validation_id"])
 
         self.assertEqual(result["status"], "draft-pr-created")
-        self.assertEqual(result["commit_sha"], result["remote_sha"])
+        self.assertEqual(
+            result["pr_url"], "https://github.com/example/repository/pull/7"
+        )
         self.assertTrue(result["worktree_retained"])
         self.assertTrue(assignment.worktree.is_dir())
         self.assertEqual(checked("status", "--porcelain", cwd=assignment.worktree), "")
@@ -427,13 +416,11 @@ class PureContractTest(unittest.TestCase):
         self.assertNotEqual(first, other)
         self.assertTrue(first.startswith("opencode/unit-test/alphaservice-"))
 
-    def test_pr_verification_requires_open_draft_and_exact_sha(self) -> None:
+    def test_publish_only_creates_draft_pr(self) -> None:
         source = Path(publish.__file__).read_text(encoding="utf-8")
 
-        self.assertIn('"isDraft": True', source)
-        self.assertIn('"state": "OPEN"', source)
-        self.assertIn('"headRefOid": commit_sha', source)
         self.assertIn('"--draft"', source)
+        self.assertNotIn('"view"', source)
         self.assertNotIn('"merge"', source)
         self.assertNotIn('"ready"', source)
 
@@ -444,6 +431,15 @@ class PureContractTest(unittest.TestCase):
         self.assertNotIn("list_existing_prs", source)
         self.assertNotIn("reconcile", source)
         self.assertNotIn("reused", source)
+
+    def test_publish_has_no_duplicate_post_publish_checks(self) -> None:
+        source = Path(publish.__file__).read_text(encoding="utf-8")
+
+        self.assertNotIn("require_remote_sha", source)
+        self.assertNotIn("remote_sha", source)
+        self.assertNotIn("git_nul_paths", source)
+        self.assertNotIn("git show", source)
+        self.assertNotIn("MAX_PR_BODY_BYTES", source)
 
 
 if __name__ == "__main__":

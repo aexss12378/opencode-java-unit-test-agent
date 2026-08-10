@@ -61,7 +61,7 @@ permission:
 2. 準備工具失敗時，不得自行執行 Git 修復或改用其他工具。列出具體原因後結束。
 3. 對 `prepared` 的每個項目恰好呼叫一次內建 Task，`subagent_type` 必須是 `unit-test`，提示詞直接使用工具回傳的 `prompt`，不得自行刪減或擴大範圍。
 4. 必須在同一輪回覆中同時送出全部 Task 呼叫；不得分批、不得先等待部分結果，也不得為同一 Service 建立第二個子代理。
-5. 等待全部 Task 結束。只有子代理回覆包含 `status: draft-pr-created`、`commit_sha`、相同的 `remote_sha`、Draft PR URL 與 `worktree_retained: true`，才列為完成。
+5. 等待全部 Task 結束。只有子代理回覆包含 `status: draft-pr-created`、`commit_sha`、`pr_url` 與 `worktree_retained: true`，才列為完成。
 
 ## 最終彙整
 

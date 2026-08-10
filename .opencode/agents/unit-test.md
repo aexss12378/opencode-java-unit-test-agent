@@ -69,9 +69,7 @@ permission:
 - `target_class`
 - `branch`
 - `commit_sha`
-- `remote_sha`
-- Draft PR URL 與 draft 狀態
+- `pr_url`（Draft PR）
 - `worktree` 與 `worktree_retained`
-- 實際執行測試數與行覆蓋率
 
 不得宣稱 PR 已轉為 Ready、已合併或已進入 `main`。
