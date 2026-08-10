@@ -4,7 +4,8 @@
   "permission": {
     "external_directory": "deny",
     "javadoc_edit": "deny",
-    "validate_unit_tests": "deny",
-    "submit_unit_tests": "deny"
+    "prepare_unit_test_workspaces": "deny",
+    "validate_unit_test": "deny",
+    "publish_unit_test": "deny"
   }
 }

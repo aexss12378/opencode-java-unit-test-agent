@@ -1,17 +1,18 @@
 ---
-description: 盤點所有 Service，並驗證每個 Service 都會取得獨立子代理
+description: 為全部具體 Service 平行建立單元測試，驗證後各自建立 Draft PR
 agent: unit-test-orchestrator
 subtask: false
 ---
 
-執行模式：`unit-test-all/task-smoke/v1`
+execution_mode: unit-test-all/v2
 
-這一輪只驗證 OpenCode 內建 Task 的派工行為，不撰寫、不驗證、也不提交任何單元測試。
+這次指令代表工程師已預先授權以下固定流程，不得再次詢問是否開始、範圍、平行數量、提交、推送或建立 Draft PR：
 
-1. 盤點 `src/main/java` 中，簡單類別名稱以 `Service` 結尾的所有具體頂層類別；排除介面、抽象類別、巢狀類別與測試類別。
-2. 每個符合範圍的 Service 必須恰好呼叫一次內建 Task，並指定 `unit-test` 子代理；不得使用 SDK、plugin 或舊自訂派工工具。
-3. 每次 Task 的提示詞必須包含 `execution_mode: unit-test-all/task-smoke/v1`、唯一的 `target_class`，以及 `operation: dispatch-check-only`。
-4. 本輪子代理只能回覆收到的 `target_class`，不得呼叫任何工具或修改檔案。
-5. 等待全部 Task 結束後，核對盤點數、Task 數與成功回覆數完全相同，再逐一列出 Service 與對應結果。
+1. 完整盤點 `src/main/java` 中，簡單類別名稱以 `Service` 結尾的所有具體頂層類別；排除介面、抽象類別、巢狀類別與測試類別。
+2. 每個具備可信規格來源的 Service 建立一條獨立分支、一個專案內可見工作樹與一個全新的 `unit-test` 子代理。
+3. 子代理只修改自己工作樹中的唯一測試檔；驗證通過後由子代理呼叫發布工具提交、推送並建立 Draft PR。
+4. 同時最多執行兩個子代理。全部工作樹都保留供工程師查看，本次不執行清理。
+5. 缺少可信規格或規格彼此衝突的 Service 不得編造預期結果，也不得靜默略過；列為未開始並附上原因。
+6. 基準必須是乾淨、已與 GitHub 遠端同步的 `main`。前置檢查失敗時直接回報，不得自行暫存、提交、捨棄或修復工程師的變更。
 
-留在目前主要工作階段完成派工與結果彙整。
+請留在目前主要工作階段，依 `unit-test-orchestrator` 的固定流程完成所有派工並彙整結果。

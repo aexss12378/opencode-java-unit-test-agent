@@ -1,25 +1,21 @@
 import { tool } from "@opencode-ai/plugin"
 import path from "node:path"
 
-type BackendResult = {
-  status?: string
-  [key: string]: unknown
-}
+type BackendResult = { status?: string; [key: string]: unknown }
 
-async function runUnitTestBackend(
+async function runBackend(
   projectRoot: string,
   sessionID: string,
+  input: unknown,
   abort: AbortSignal,
 ): Promise<BackendResult> {
-  const script = path.join(import.meta.dir, "submit_unit_tests.py")
-  const process = Bun.spawn(
+  const child = Bun.spawn(
     [
       "uv",
       "run",
       "--no-project",
       "python",
-      script,
-      "validate",
+      path.join(import.meta.dir, "publish_unit_test.py"),
       "--repo",
       projectRoot,
       "--session-id",
@@ -39,39 +35,33 @@ async function runUnitTestBackend(
       stderr: "pipe",
     },
   )
-
-  process.stdin.write("{}")
-  process.stdin.end()
-
-  let cancelled = abort.aborted
+  child.stdin.write(JSON.stringify(input))
+  child.stdin.end()
+  let wasCancelled = abort.aborted
   const cancel = () => {
-    cancelled = true
-    process.kill("SIGTERM")
+    wasCancelled = true
+    child.kill("SIGTERM")
   }
-  if (cancelled) cancel()
+  if (wasCancelled) cancel()
   else abort.addEventListener("abort", cancel, { once: true })
-
   let stdout: string
   let stderr: string
   let exitCode: number
   try {
     ;[stdout, stderr, exitCode] = await Promise.all([
-      new Response(process.stdout).text(),
-      new Response(process.stderr).text(),
-      process.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
     ])
   } finally {
     abort.removeEventListener("abort", cancel)
   }
-
   try {
     return JSON.parse(stdout.trim()) as BackendResult
   } catch {
     return {
-      status: cancelled ? "cancelled" : "tool-error",
-      message: cancelled
-        ? "單元測試工作已取消；後端未完成可驗證的結果。"
-        : "單元測試後端沒有回傳有效 JSON",
+      status: wasCancelled ? "cancelled" : "tool-error",
+      message: wasCancelled ? "工作已取消。" : "發布工具沒有回傳有效 JSON",
       exit_code: exitCode,
       stderr: stderr.trim().slice(-4000),
     }
@@ -80,17 +70,20 @@ async function runUnitTestBackend(
 
 export default tool({
   description:
-    "驗證目前派工 worktree 內的唯一 Service 測試檔。工具會清除該 worktree 的舊 target、執行指定測試類別的 Maven test，解析 Surefire 與 JaCoCo XML，並確認只有派工測試檔有 Git 變更；不提交也不推送。",
-  args: {},
-  async execute(_args, context) {
+    "只發布最新 validate_unit_test 憑證綁定的候選測試。工具會提交、推送、建立 Draft PR，並重新核對遠端 SHA 與 PR 狀態；不會轉為 Ready、合併或清理工作樹。",
+  args: {
+    assignment_id: tool.schema.string().regex(/^[0-9a-f]{24}$/),
+    validation_id: tool.schema.string().regex(/^[0-9a-f]{24}$/),
+  },
+  async execute(args, context) {
     if (context.agent !== "unit-test") {
       return JSON.stringify({
         status: "blocked",
-        message: `validate_unit_tests 只允許 unit-test 工作代理使用，目前代理為 ${context.agent}`,
+        message: `publish_unit_test 只允許 unit-test 子代理使用，目前代理為 ${context.agent}`,
       })
     }
     return JSON.stringify(
-      await runUnitTestBackend(context.worktree, context.sessionID, context.abort),
+      await runBackend(context.worktree, context.sessionID, args, context.abort),
     )
   },
 })
