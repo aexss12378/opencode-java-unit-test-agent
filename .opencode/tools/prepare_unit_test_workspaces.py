@@ -12,7 +12,6 @@ from typing import Any
 from _unit_test_common import (
     ASSIGNMENT_VERSION,
     BATCH_EXECUTION_MODE,
-    MAX_CONCURRENCY,
     MAX_TARGETS,
     NOT_STARTED_REASONS,
     BaseContext,
@@ -133,14 +132,6 @@ def normalize_specification_source(
 def validate_request(repo: Path, data: dict[str, Any]) -> dict[str, Any]:
     if data.get("execution_mode") != BATCH_EXECUTION_MODE:
         raise RequestError(f"execution_mode 必須是 {BATCH_EXECUTION_MODE}")
-    max_concurrency = data.get("max_concurrency")
-    if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int):
-        raise RequestError("max_concurrency 必須是整數")
-    if not 1 <= max_concurrency <= MAX_CONCURRENCY:
-        raise RequestError(f"max_concurrency 必須介於 1 到 {MAX_CONCURRENCY}")
-    if max_concurrency != 2:
-        raise RequestError(f"{BATCH_EXECUTION_MODE} 的 max_concurrency 固定為 2")
-
     raw_targets = data.get("targets")
     raw_not_started = data.get("not_started")
     if not isinstance(raw_targets, list) or len(raw_targets) > MAX_TARGETS:
@@ -201,7 +192,6 @@ def validate_request(repo: Path, data: dict[str, Any]) -> dict[str, Any]:
         raise RequestError("全部 Service 的分類不完整；" + "；".join(details))
     return {
         "execution_mode": BATCH_EXECUTION_MODE,
-        "max_concurrency": max_concurrency,
         "targets": sorted(targets, key=lambda item: item["target_class"]),
         "not_started": sorted(not_started, key=lambda item: item["target_class"]),
         "target_order": discovered,
@@ -405,7 +395,6 @@ def prepare(repo: Path, session_id: str, request: dict[str, Any]) -> dict[str, A
         "execution_mode": request["execution_mode"],
         "base_branch": base.remote_branch,
         "base_sha": base.head_sha,
-        "max_concurrency": request["max_concurrency"],
         "service_count": len(request["target_order"]),
         "target_order": request["target_order"],
         "prepared": prepared,

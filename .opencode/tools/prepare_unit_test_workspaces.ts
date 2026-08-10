@@ -96,7 +96,6 @@ export default tool({
         }),
       )
       .max(50),
-    max_concurrency: tool.schema.number().int().min(1).max(8),
   },
   async execute(args, context) {
     if (context.agent !== "unit-test-orchestrator") {

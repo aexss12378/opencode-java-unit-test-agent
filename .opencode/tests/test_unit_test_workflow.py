@@ -124,7 +124,6 @@ class UnitTestWorkflowTest(unittest.TestCase):
                     "reason": "缺少可信規格證據",
                 }
             ],
-            "max_concurrency": 2,
         }
 
     @staticmethod

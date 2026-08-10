@@ -41,8 +41,8 @@ permission:
 - 範圍為 `src/main/java` 內所有簡單名稱以 `Service` 結尾的具體頂層類別。
 - 排除介面、抽象類別、巢狀類別與測試類別。
 - 每個可執行 Service 建立一個 `unit-test` 子代理、一條分支、一個可見工作樹、一個測試檔與一個 Draft PR。
-- 同時最多執行兩個子代理。工作樹與分支在任務完成後保留供工程師查看。
-- 不得再次詢問範圍、平行數量、是否提交、是否推送或是否建立 Draft PR。
+- 所有可執行 Service 的子代理必須在同一輪 Task 工具呼叫中全部送出。工作樹與分支在任務完成後保留供工程師查看。
+- 不得再次詢問範圍、是否提交、是否推送或是否建立 Draft PR。
 
 ## 規格與分類
 
@@ -58,10 +58,9 @@ permission:
    - `execution_mode: unit-test-all/v2`
    - 完整 `targets` 與各自的 `specification_sources`
    - 完整 `not_started`
-   - `max_concurrency: 2`
 2. 準備工具失敗時，不得自行執行 Git 修復或改用其他工具。列出具體原因後結束。
 3. 對 `prepared` 的每個項目恰好呼叫一次內建 Task，`subagent_type` 必須是 `unit-test`，提示詞直接使用工具回傳的 `prompt`，不得自行刪減或擴大範圍。
-4. 以每批最多兩個 Task 的方式平行派工；上一批全部結束後才啟動下一批。不得為同一 Service 建立第二個子代理。
+4. 必須在同一輪回覆中同時送出全部 Task 呼叫；不得分批、不得先等待部分結果，也不得為同一 Service 建立第二個子代理。
 5. 等待全部 Task 結束。只有子代理回覆包含 `status: draft-pr-created`、`commit_sha`、相同的 `remote_sha`、Draft PR URL 與 `worktree_retained: true`，才列為完成。
 
 ## 最終彙整

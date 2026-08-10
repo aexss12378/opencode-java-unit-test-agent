@@ -8,6 +8,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 COMMAND = PROJECT_ROOT / ".opencode/commands/unit-test-all.md"
 ORCHESTRATOR = PROJECT_ROOT / ".opencode/agents/unit-test-orchestrator.md"
 UNIT_TEST_AGENT = PROJECT_ROOT / ".opencode/agents/unit-test.md"
+PREPARE_TOOL = PROJECT_ROOT / ".opencode/tools/prepare_unit_test_workspaces.ts"
+PREPARE_BACKEND = PROJECT_ROOT / ".opencode/tools/prepare_unit_test_workspaces.py"
 
 
 def frontmatter(text: str) -> dict[str, str]:
@@ -30,7 +32,7 @@ class UnitTestAllCommandTest(unittest.TestCase):
         self.assertEqual(metadata["agent"], "unit-test-orchestrator")
         self.assertEqual(metadata["subtask"], "false")
         self.assertIn("unit-test-all/v2", text)
-        self.assertIn("同時最多執行兩個子代理", text)
+        self.assertIn("一次觸發所有可執行 Service 的子代理", text)
         self.assertIn("提交、推送並建立 Draft PR", text)
         self.assertIn("本次不執行清理", text)
 
@@ -47,7 +49,19 @@ class UnitTestAllCommandTest(unittest.TestCase):
         self.assertIn("unit-test-all/v2", text)
         self.assertIn("`subagent_type` 必須是 `unit-test`", text)
         self.assertIn("每個項目恰好呼叫一次", text)
-        self.assertIn("每批最多兩個 Task", text)
+        self.assertIn("同時送出全部 Task 呼叫", text)
+        self.assertIn("不得分批", text)
+        self.assertNotIn("max_concurrency", text)
+
+    def test_all_service_dispatch_has_no_concurrency_cap(self) -> None:
+        sources = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (COMMAND, ORCHESTRATOR, PREPARE_TOOL, PREPARE_BACKEND)
+        )
+
+        self.assertNotIn("max_concurrency", sources)
+        self.assertNotIn("每批", sources)
+        self.assertIn("一次觸發所有可執行 Service", sources)
 
     def test_worker_can_edit_nested_tests_validate_and_publish(self) -> None:
         text = UNIT_TEST_AGENT.read_text(encoding="utf-8")
