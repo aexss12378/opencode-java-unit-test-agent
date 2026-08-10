@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shutil
+import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -32,6 +33,68 @@ from _unit_test_common import (
 
 MAVEN_TIMEOUT_SECONDS = 600
 MINIMUM_LINE_COVERAGE_PERCENT = 80
+
+
+def validation_pom(project: Path, candidate_class: str) -> Path:
+    source = project / "pom.xml"
+    try:
+        tree = ET.parse(source)
+    except (ET.ParseError, OSError) as exc:
+        raise RequestError("無法解析 pom.xml 以隔離候選測試編譯") from exc
+
+    root = tree.getroot()
+    namespace = ""
+    if root.tag.startswith("{"):
+        namespace = root.tag.partition("}")[0] + "}"
+        ET.register_namespace("", namespace[1:-1])
+
+    def tag(name: str) -> str:
+        return f"{namespace}{name}"
+
+    build = root.find(tag("build"))
+    if build is None:
+        build = ET.SubElement(root, tag("build"))
+    plugins = build.find(tag("plugins"))
+    if plugins is None:
+        plugins = ET.SubElement(build, tag("plugins"))
+
+    compiler = None
+    for plugin in plugins.findall(tag("plugin")):
+        artifact = plugin.find(tag("artifactId"))
+        group = plugin.find(tag("groupId"))
+        if (
+            artifact is not None
+            and artifact.text == "maven-compiler-plugin"
+            and (group is None or group.text in (None, "org.apache.maven.plugins"))
+        ):
+            compiler = plugin
+            break
+    if compiler is None:
+        compiler = ET.SubElement(plugins, tag("plugin"))
+        ET.SubElement(compiler, tag("groupId")).text = "org.apache.maven.plugins"
+        ET.SubElement(compiler, tag("artifactId")).text = "maven-compiler-plugin"
+
+    configuration = compiler.find(tag("configuration"))
+    if configuration is None:
+        configuration = ET.SubElement(compiler, tag("configuration"))
+    for existing in configuration.findall(tag("testIncludes")):
+        configuration.remove(existing)
+    includes = ET.SubElement(configuration, tag("testIncludes"))
+    ET.SubElement(includes, tag("testInclude")).text = (
+        candidate_class.replace(".", "/") + ".java"
+    )
+
+    descriptor, raw_path = tempfile.mkstemp(
+        prefix=".opencode-validation-", suffix=".xml", dir=project
+    )
+    os.close(descriptor)
+    path = Path(raw_path)
+    try:
+        tree.write(path, encoding="utf-8", xml_declaration=True)
+    except (OSError, UnicodeError) as exc:
+        path.unlink(missing_ok=True)
+        raise RequestError("無法建立候選測試的 Maven 隔離設定") from exc
+    return path
 
 
 def clear_maven_outputs(project: Path) -> None:
@@ -86,15 +149,30 @@ def maven_environment(project: Path) -> dict[str, str]:
 
 
 def run_maven(project: Path, candidate_class: str) -> dict[str, Any]:
-    result = run_command(
-        [str(project / "mvnw"), "-B", "-ntp", f"-Dtest={candidate_class}", "test"],
-        cwd=project,
-        timeout=MAVEN_TIMEOUT_SECONDS,
-        env=maven_environment(project),
-    )
+    pom = validation_pom(project, candidate_class)
+    try:
+        result = run_command(
+            [
+                str(project / "mvnw"),
+                "-B",
+                "-ntp",
+                "-f",
+                str(pom),
+                f"-Dtest={candidate_class}",
+                "test",
+            ],
+            cwd=project,
+            timeout=MAVEN_TIMEOUT_SECONDS,
+            env=maven_environment(project),
+        )
+    finally:
+        pom.unlink(missing_ok=True)
     output_lines = result.stdout.splitlines() + result.stderr.splitlines()
     return {
-        "command": f"./mvnw -B -ntp -Dtest={candidate_class} test",
+        "command": (
+            "./mvnw -B -ntp -f <isolated-test-pom> "
+            f"-Dtest={candidate_class} test"
+        ),
         "exit_code": result.returncode,
         "timed_out": result.returncode == 124,
         "maven_errors": "\n".join(line for line in output_lines if "[ERROR]" in line),
