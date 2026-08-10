@@ -228,6 +228,9 @@ class WorkflowRepositoryTest(unittest.TestCase):
         self.assertTrue(all(path.is_dir() for path in worktrees))
         self.assertEqual(len({item["branch"] for item in result["prepared"]}), 2)
         self.assertTrue(all(item["prompt"] for item in result["prepared"]))
+        self.assertTrue(
+            all("不得呼叫 submit_unit_tests" in item["prompt"] for item in result["prepared"])
+        )
         self.assertEqual(checked("worktree", "list", "--porcelain", cwd=self.repo).count("worktree "), 3)
         self.assertEqual(checked("rev-parse", "HEAD", cwd=self.repo), self.base_sha)
         for item in result["prepared"]:
@@ -331,7 +334,7 @@ class WorkflowRepositoryTest(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(result["status"], "worker-finished-without-submission")
+        self.assertEqual(result["status"], "worker-finished-without-validation")
         self.assertTrue(result["worktree_retained"])
         self.assertEqual(Path(result["worktree"]), worktree.project)
 
@@ -379,6 +382,95 @@ class WorkflowRepositoryTest(unittest.TestCase):
         self.assertEqual(result["validation"]["coverage"]["percent"], 100.0)
         self.assertEqual(checked("rev-parse", "HEAD", cwd=worktree.project), self.base_sha)
         self.assertEqual(backend.changed_paths(worktree.project), {assignment.test_file})
+        self.assertFalse(result["submitted"])
+        self.assertFalse(result["pr_created"])
+        self.assertEqual(
+            result["candidate_sha256"],
+            backend.hashlib.sha256(request["file"]["content"].encode("utf-8")).hexdigest(),
+        )
+        saved_result = json.loads(assignment.result_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved_result, result)
+
+    def test_finalize_validated_result_retains_local_worktree(self) -> None:
+        worktree, assignment = self.prepare("session-local-validation", "AlphaService")
+        request = self.write_candidate(worktree, assignment, "AlphaService")
+        with (
+            patch.object(backend, "verify_assignment_state"),
+            patch.object(backend, "run_maven", side_effect=self.maven_success),
+            patch.object(backend, "test_summary", side_effect=self.summary_success),
+            patch.object(backend, "coverage_summary", side_effect=self.coverage_success),
+        ):
+            validated = backend.validate_action(worktree.project, assignment, request)
+            backend.bind_assignment(
+                worktree.project,
+                "session-local-validation",
+                {
+                    "assignment_id": assignment.assignment_id,
+                    "worker_session_id": "child-local-validation",
+                },
+            )
+
+        with patch.object(backend, "verify_assignment_state"):
+            result = backend.finalize_assignment(
+                worktree.project,
+                "session-local-validation",
+                {
+                    "assignment_id": assignment.assignment_id,
+                    "worker_session_id": "child-local-validation",
+                    "worker_message": "本地驗證完成",
+                    "worker_error": "",
+                    "cancelled": False,
+                },
+            )
+
+        self.assertEqual(validated["status"], "validation-passed")
+        self.assertEqual(result["status"], "validation-passed")
+        self.assertTrue(result["post_worker_verified"])
+        self.assertTrue(result["worktree_retained"])
+        self.assertEqual(Path(result["worktree"]), worktree.project)
+        self.assertEqual(checked("rev-parse", "HEAD", cwd=worktree.project), self.base_sha)
+        self.assertEqual(backend.changed_paths(worktree.project), {assignment.test_file})
+        self.assertIsNone(
+            backend.remote_sha(worktree.project, assignment.base.remote, assignment.branch)
+        )
+
+    def test_finalize_rejects_candidate_changed_after_validation(self) -> None:
+        worktree, assignment = self.prepare("session-stale-validation", "AlphaService")
+        request = self.write_candidate(worktree, assignment, "AlphaService")
+        with (
+            patch.object(backend, "verify_assignment_state"),
+            patch.object(backend, "run_maven", side_effect=self.maven_success),
+            patch.object(backend, "test_summary", side_effect=self.summary_success),
+            patch.object(backend, "coverage_summary", side_effect=self.coverage_success),
+        ):
+            backend.validate_action(worktree.project, assignment, request)
+            backend.bind_assignment(
+                worktree.project,
+                "session-stale-validation",
+                {
+                    "assignment_id": assignment.assignment_id,
+                    "worker_session_id": "child-stale-validation",
+                },
+            )
+        candidate = worktree.project / assignment.test_file
+        candidate.write_text(candidate.read_text(encoding="utf-8") + "// 驗證後修改\n", encoding="utf-8")
+
+        with patch.object(backend, "verify_assignment_state"):
+            result = backend.finalize_assignment(
+                worktree.project,
+                "session-stale-validation",
+                {
+                    "assignment_id": assignment.assignment_id,
+                    "worker_session_id": "child-stale-validation",
+                    "worker_message": "完成",
+                    "worker_error": "",
+                    "cancelled": False,
+                },
+            )
+
+        self.assertEqual(result["status"], "post-worker-verification-failed")
+        self.assertIn("最新一次驗證後又修改", result["message"])
+        self.assertTrue(result["worktree_retained"])
 
     def test_maven_failure_returns_only_error_diagnostics(self) -> None:
         worktree, assignment = self.prepare("session-maven-fail", "AlphaService")

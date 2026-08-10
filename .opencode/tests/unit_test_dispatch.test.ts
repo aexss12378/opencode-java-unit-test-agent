@@ -51,20 +51,18 @@ function backendFor(assignments: ReturnType<typeof prepared>) {
       const assignment = assignments.find(
         (item) => item.assignment_id === input.assignment_id,
       )!
-      const sha = String(input.worker_session_id).padEnd(40, "0").slice(0, 40)
       return {
-        status: "draft-pr-created",
+        status: "validation-passed",
         target_class: assignment.target_class,
         test_file: assignment.test_file,
         branch: assignment.branch,
         base_sha: assignment.base_sha,
         worker_session_id: input.worker_session_id,
-        pr_created: true,
-        pr_verified: true,
-        pr: { draft: true, url: "https://example.invalid/pr" },
-        commit_sha: sha,
-        remote_sha: sha,
-        worktree_retained: false,
+        submitted: false,
+        pr_created: false,
+        post_worker_verified: true,
+        worktree_retained: true,
+        worktree: assignment.worktree,
       }
     }
     throw new Error(`未預期的後端動作：${action}`)
@@ -126,6 +124,9 @@ describe("unit-test 子工作階段分派", () => {
 
     expect(result.status).toBe("completed")
     expect(result.child_session_count).toBe(2)
+    expect(result.validated_count).toBe(2)
+    expect(result.submitted_count).toBe(0)
+    expect(result.draft_pr_count).toBe(0)
     const creates = sdkCalls.filter((call) => call.action === "create")
     expect(creates).toHaveLength(2)
     for (const [index, call] of creates.entries()) {

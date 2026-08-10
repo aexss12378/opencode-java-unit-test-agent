@@ -12,7 +12,7 @@ export const UnitTestDispatchPlugin: Plugin = async ({ client }) => ({
   tool: {
     dispatch_unit_tests: tool({
       description:
-        "由主代理為每個已確認的 Java Service 建立獨立分支與 Git worktree，並建立掛在目前主工作階段下的 unit-test 子代理。每個子代理的工作目錄固定為自己的 worktree；完成後彙整 JaCoCo 行覆蓋率與已驗證 Draft PR。",
+        "由主代理為每個已確認的 Java Service 建立獨立本機分支與 Git worktree，並建立掛在目前主工作階段下的 unit-test 子代理。每個子代理的工作目錄固定為自己的 worktree；完成後彙整 Maven、JaCoCo 與保留的 worktree，不提交、不推送也不建立 PR。",
       args: {
         targets: tool.schema
           .array(

@@ -113,15 +113,14 @@ function responseText(value: unknown): string {
     .slice(-4_000)
 }
 
-function verifiedSuccess(result: Record<string, unknown>): boolean {
+function verifiedValidationSuccess(result: Record<string, unknown>): boolean {
   return (
-    result.status === "draft-pr-created" &&
-    result.pr_created === true &&
-    result.pr_verified === true &&
-    isRecord(result.pr) &&
-    result.pr.draft === true &&
-    typeof result.commit_sha === "string" &&
-    result.commit_sha === result.remote_sha
+    result.status === "validation-passed" &&
+    result.post_worker_verified === true &&
+    result.submitted === false &&
+    result.pr_created === false &&
+    result.worktree_retained === true &&
+    typeof result.worktree === "string"
   )
 }
 
@@ -341,7 +340,7 @@ export async function dispatchUnitTests(
         manual_recovery_required: true,
       },
   )
-  const successCount = results.filter(verifiedSuccess).length
+  const successCount = results.filter(verifiedValidationSuccess).length
   const overall =
     successCount === results.length
       ? "completed"
@@ -350,7 +349,7 @@ export async function dispatchUnitTests(
         : "partial-failure"
   return {
     status: overall,
-    message: `${results.length} 個 Service 已結束：${successCount} 個建立並驗證 Draft PR，${results.length - successCount} 個未完成。`,
+    message: `${results.length} 個 Service 已結束：${successCount} 個完成本地驗證並保留 worktree，${results.length - successCount} 個未完成。沒有提交、推送或建立 PR。`,
     dispatched: true,
     parent_session_id: context.sessionID,
     base_branch: preparation.base_branch,
@@ -360,7 +359,9 @@ export async function dispatchUnitTests(
     child_session_count: results.filter(
       (result) => typeof result.worker_session_id === "string",
     ).length,
-    draft_pr_count: successCount,
+    validated_count: successCount,
+    submitted_count: 0,
+    draft_pr_count: 0,
     results,
   }
 }

@@ -8,6 +8,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 COMMAND = PROJECT_ROOT / ".opencode/commands/unit-test-all.md"
 ORCHESTRATOR = PROJECT_ROOT / ".opencode/agents/unit-test-orchestrator.md"
+UNIT_TEST_AGENT = PROJECT_ROOT / ".opencode/agents/unit-test.md"
 SKILL = PROJECT_ROOT / ".opencode/skills/springboot-java-unit-testing/SKILL.md"
 
 
@@ -41,6 +42,13 @@ class UnitTestAllCommandTest(unittest.TestCase):
         self.assertIn("unit-test-all/v1", text)
         self.assertIn("`max_concurrency: 2`", text)
         self.assertIn("缺少可信規格證據", text)
+
+    def test_worker_can_validate_but_cannot_submit(self) -> None:
+        text = UNIT_TEST_AGENT.read_text(encoding="utf-8")
+
+        self.assertRegex(text, r"(?m)^  validate_unit_tests: allow$")
+        self.assertRegex(text, r"(?m)^  submit_unit_tests: deny$")
+        self.assertIn("不得提交、推送、建立 PR", text)
 
     def test_skill_recognizes_the_same_preapproved_mode(self) -> None:
         text = SKILL.read_text(encoding="utf-8")

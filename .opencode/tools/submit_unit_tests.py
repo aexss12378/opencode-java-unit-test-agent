@@ -776,11 +776,12 @@ def worker_prompt(assignment: Assignment) -> str:
     return (
         "你正在由主代理建立的獨立 Git worktree 內執行單一 Service 測試工作。\n"
         f"唯一受測類別：{assignment.target_class}\n"
-        f"唯一允許提交的測試檔：{assignment.test_file}\n"
+        f"唯一允許修改的測試檔：{assignment.test_file}\n"
         "可信規格來源：\n"
         f"{sources}\n\n"
         "依 unit-test 代理規則完成案例設計，直接用 edit 或 write 建立或更新上述唯一測試檔。"
-        "每次修改後呼叫 validate_unit_tests；依 Maven 與 JaCoCo 結果修正，通過後呼叫 submit_unit_tests。"
+        "每次修改後呼叫 validate_unit_tests；依 Maven 與 JaCoCo 結果修正。"
+        "最新一次驗證回傳 validation-passed 後直接結束，不得呼叫 submit_unit_tests、提交、推送或建立 PR。"
         "不得處理其他類別，不得使用 task，不得修改正式原始碼或 pom.xml。"
     )
 
@@ -828,6 +829,60 @@ def verified_success(result: dict[str, Any]) -> bool:
         and isinstance(result.get("commit_sha"), str)
         and result.get("commit_sha") == result.get("remote_sha")
     )
+
+
+def validated_result(result: dict[str, Any]) -> bool:
+    validation = result.get("validation")
+    candidate_tests = validation.get("candidate_tests") if isinstance(validation, dict) else None
+    coverage = validation.get("coverage") if isinstance(validation, dict) else None
+    digest = result.get("candidate_sha256")
+    return (
+        result.get("status") == "validation-passed"
+        and result.get("submitted") is False
+        and result.get("pr_created") is False
+        and isinstance(digest, str)
+        and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+        and isinstance(candidate_tests, dict)
+        and isinstance(candidate_tests.get("tests"), int)
+        and candidate_tests.get("tests", 0) > 0
+        and candidate_tests.get("skipped") == 0
+        and candidate_tests.get("unexpected_classes") == []
+        and isinstance(coverage, dict)
+        and coverage.get("passed") is True
+    )
+
+
+def verified_completion(result: dict[str, Any]) -> bool:
+    return verified_success(result) or (
+        validated_result(result)
+        and result.get("post_worker_verified") is True
+        and result.get("worktree_retained") is True
+    )
+
+
+def verify_validated_worker(worktree: Worktree, assignment: Assignment, result: dict[str, Any]) -> None:
+    if not validated_result(result):
+        raise RequestError("工作代理結果不符合本地驗證完成條件")
+    if result.get("target_class") != assignment.target_class:
+        raise RequestError("工作代理結果的受測類別與派工清單不一致")
+    if result.get("test_file") != assignment.test_file:
+        raise RequestError("工作代理結果的測試檔與派工清單不一致")
+    if result.get("branch") != assignment.branch or result.get("base_sha") != assignment.base.head_sha:
+        raise RequestError("工作代理結果的 Git 基準或分支與派工清單不一致")
+
+    verify_assignment_state(worktree.project, assignment, require_base_head=True)
+    require_only_path(changed_paths(worktree.project), assignment.test_file, "工作代理完成驗證後")
+    candidate = destination(worktree.project, PurePosixPath(assignment.test_file))
+    if candidate.is_symlink() or not candidate.is_file():
+        raise RequestError("工作代理完成驗證後候選測試不再是一般檔案")
+    try:
+        digest = hashlib.sha256(candidate.read_text(encoding="utf-8").encode("utf-8")).hexdigest()
+    except (OSError, UnicodeError) as exc:
+        raise RequestError("工作代理完成驗證後無法讀取候選測試") from exc
+    if digest != result["candidate_sha256"]:
+        raise RequestError("工作代理在最新一次驗證後又修改了候選測試")
+    if remote_sha(worktree.project, assignment.base.remote, assignment.branch) is not None:
+        raise RequestError("只驗證模式不應存在遠端派工分支")
 
 
 def verify_completed_worker(worktree: Worktree, assignment: Assignment, result: dict[str, Any]) -> None:
@@ -984,16 +1039,16 @@ def finalize_assignment(repo: Path, coordinator_session_id: str, request: dict[s
             if supplied_worker_session_id is None
             else "worker-failed"
             if worker_error
-            else "worker-finished-without-submission"
+            else "worker-finished-without-validation"
         )
         message = (
-            "子工作階段已取消，尚未取得可驗證的發布結果。"
+            "子工作階段已取消，尚未取得可核對的驗證結果。"
             if cancelled
             else "無法建立或綁定子工作階段。"
             if supplied_worker_session_id is None
-            else "子工作階段執行失敗，尚未取得可驗證的發布結果。"
+            else "子工作階段執行失敗，尚未取得可核對的驗證結果。"
             if worker_error
-            else "子工作階段已結束，但沒有呼叫發布工具或沒有產生可驗證的發布結果。"
+            else "子工作階段已結束，但沒有呼叫驗證工具或沒有產生可核對的驗證結果。"
         )
         result = {
             "status": status_value,
@@ -1018,7 +1073,18 @@ def finalize_assignment(repo: Path, coordinator_session_id: str, request: dict[s
         result["worker_error"] = worker_error
 
     worktree = Worktree(root=repo.parent, project=repo, branch=assignment.branch)
-    if verified_success(result):
+    if validated_result(result):
+        try:
+            verify_validated_worker(worktree, assignment, result)
+        except (RequestError, OSError, UnicodeError) as exc:
+            result["validated_status"] = result["status"]
+            result["status"] = "post-worker-verification-failed"
+            result["message"] = str(exc)
+            result["manual_recovery_required"] = True
+            result["automatic_retry_supported"] = False
+        else:
+            result["post_worker_verified"] = True
+    elif verified_success(result):
         try:
             verify_completed_worker(worktree, assignment, result)
         except (RequestError, OSError, UnicodeError) as exc:
@@ -1295,11 +1361,12 @@ def validate_candidate(project: Path, assignment: Assignment, request: dict[str,
 
 
 def validate_action(repo: Path, assignment: Assignment, request: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any]
     try:
         verify_assignment_state(repo, assignment, require_base_head=True)
         validation, failure = validate_candidate(repo, assignment, request)
         if failure is not None:
-            return {
+            result = {
                 **failure,
                 "assignment_id": assignment.assignment_id,
                 "target_class": assignment.target_class,
@@ -1307,22 +1374,25 @@ def validate_action(repo: Path, assignment: Assignment, request: dict[str, Any])
                 "base_sha": assignment.base.head_sha,
                 "branch": assignment.branch,
             }
-        assert validation is not None
-        return {
-            "status": "validation-passed",
-            "message": "候選測試已通過 Maven，且 JaCoCo 目標類別行覆蓋率達到門檻；可呼叫 submit_unit_tests。",
-            "assignment_id": assignment.assignment_id,
-            "target_class": assignment.target_class,
-            "test_file": assignment.test_file,
-            "base_sha": assignment.base.head_sha,
-            "branch": assignment.branch,
-            "submitted": False,
-            "pr_created": False,
-            "merged": False,
-            "validation": validation,
-        }
+        else:
+            assert validation is not None
+            digest = hashlib.sha256(request["file"]["content"].encode("utf-8")).hexdigest()
+            result = {
+                "status": "validation-passed",
+                "message": "候選測試已通過 Maven，且 JaCoCo 目標類別行覆蓋率達到門檻；內容保留在本機分支與 worktree，沒有提交、推送或建立 PR。",
+                "assignment_id": assignment.assignment_id,
+                "target_class": assignment.target_class,
+                "test_file": assignment.test_file,
+                "base_sha": assignment.base.head_sha,
+                "branch": assignment.branch,
+                "candidate_sha256": digest,
+                "submitted": False,
+                "pr_created": False,
+                "merged": False,
+                "validation": validation,
+            }
     except (RequestError, OSError, UnicodeError) as exc:
-        return {
+        result = {
             "status": "cancelled" if _CANCEL_REQUESTED else "validation-failed",
             "message": str(exc),
             "assignment_id": assignment.assignment_id,
@@ -1334,6 +1404,8 @@ def validate_action(repo: Path, assignment: Assignment, request: dict[str, Any])
             "pr_created": False,
             "merged": False,
         }
+    write_assignment_result(assignment, result)
+    return result
 
 
 # COMMIT, PUSH, AND DRAFT PR
@@ -1719,7 +1791,7 @@ def main() -> int:
             successful = result["status"] == "assignment-bound"
         elif args.action == "finalize":
             result = finalize_assignment(repo, session_id, data)
-            successful = verified_success(result)
+            successful = verified_completion(result)
         else:
             assignment = load_assignment(repo, session_id)
             request = validate_candidate_request(repo, assignment, data, require_cases=args.action == "submit")
