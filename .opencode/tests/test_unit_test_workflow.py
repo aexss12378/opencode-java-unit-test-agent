@@ -190,11 +190,7 @@ class UnitTestWorkflowTest(unittest.TestCase):
         return result
 
     def load_worker(
-        self,
-        item: dict[str, object],
-        session: str = "worker-1",
-        *,
-        require_base_head: bool = True,
+        self, item: dict[str, object], session: str = "worker-1"
     ) -> common.Assignment:
         with patch.object(
             common,
@@ -206,7 +202,6 @@ class UnitTestWorkflowTest(unittest.TestCase):
                 str(item["assignment_id"]),
                 session,
                 bind_worker=True,
-                require_base_head=require_base_head,
             )
 
     def write_candidate(
@@ -381,7 +376,7 @@ class UnitTestWorkflowTest(unittest.TestCase):
                 "github_remote",
                 return_value=("github.com", "example/repository"),
             ),
-            patch.object(publish, "create_or_reconcile_pr", side_effect=fake_pr),
+            patch.object(publish, "create_draft_pr", side_effect=fake_pr),
         ):
             result = publish.publish(assignment, validation_result["validation_id"])
 
@@ -421,61 +416,6 @@ class UnitTestWorkflowTest(unittest.TestCase):
         with self.assertRaisesRegex(common.RequestError, "驗證通過後又被修改"):
             publish.publish(assignment, validation_result["validation_id"])
 
-    def test_publish_is_reentrant_after_verified_publication(self) -> None:
-        item = self.prepare_all()["prepared"][0]
-        assignment = self.load_worker(item)
-        self.write_candidate(assignment)
-        validation_result = self.validate_candidate(assignment)
-        assignment = self.load_worker(item)
-
-        def fake_pr(
-            current: common.Assignment,
-            _receipt: dict[str, object],
-            commit_sha: str,
-        ) -> dict[str, object]:
-            return {
-                "number": 8,
-                "url": "https://github.com/example/repository/pull/8",
-                "isDraft": True,
-                "state": "OPEN",
-                "headRefName": current.branch,
-                "headRefOid": commit_sha,
-                "baseRefName": "main",
-            }
-
-        with (
-            patch.object(
-                common,
-                "github_remote",
-                return_value=("github.com", "example/repository"),
-            ),
-            patch.object(publish, "create_or_reconcile_pr", side_effect=fake_pr),
-        ):
-            first = publish.publish(assignment, validation_result["validation_id"])
-        reloaded = self.load_worker(item, require_base_head=False)
-        pr_details = {
-            "number": 8,
-            "url": "https://github.com/example/repository/pull/8",
-            "isDraft": True,
-            "state": "OPEN",
-            "headRefName": reloaded.branch,
-            "headRefOid": first["commit_sha"],
-            "baseRefName": "main",
-        }
-        with (
-            patch.object(
-                common,
-                "github_remote",
-                return_value=("github.com", "example/repository"),
-            ),
-            patch.object(publish, "list_existing_prs", return_value=[pr_details]),
-        ):
-            second = publish.publish(reloaded, validation_result["validation_id"])
-
-        self.assertEqual(second["status"], "draft-pr-created")
-        self.assertIn("重新核對", second["message"])
-        self.assertEqual(first["commit_sha"], second["commit_sha"])
-
 
 class PureContractTest(unittest.TestCase):
     def test_branch_name_is_stable_and_service_specific(self) -> None:
@@ -496,6 +436,14 @@ class PureContractTest(unittest.TestCase):
         self.assertIn('"--draft"', source)
         self.assertNotIn('"merge"', source)
         self.assertNotIn('"ready"', source)
+
+    def test_publish_has_no_retry_or_reconciliation_path(self) -> None:
+        source = Path(publish.__file__).read_text(encoding="utf-8")
+
+        self.assertNotIn("RemoteStateUnknown", source)
+        self.assertNotIn("list_existing_prs", source)
+        self.assertNotIn("reconcile", source)
+        self.assertNotIn("reused", source)
 
 
 if __name__ == "__main__":

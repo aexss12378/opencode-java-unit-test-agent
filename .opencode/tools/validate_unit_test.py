@@ -246,7 +246,7 @@ def failure(
 
 
 def validate(assignment: Assignment, data: dict[str, Any]) -> dict[str, Any]:
-    verify_assignment_state(assignment, require_base_head=True)
+    verify_assignment_state(assignment)
     snapshot = candidate_snapshot(assignment, data, require_cases=True)
     clear_maven_outputs(assignment.worktree)
     maven = run_maven(assignment.worktree, assignment.candidate_class)

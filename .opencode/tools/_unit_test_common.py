@@ -307,8 +307,6 @@ def remote_sha(
     repo: Path,
     remote: str,
     branch: str,
-    *,
-    allow_cancelled: bool = False,
 ) -> str | None:
     result = run_command(
         [
@@ -323,7 +321,6 @@ def remote_sha(
         cwd=repo,
         timeout=GIT_TIMEOUT_SECONDS,
         env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-        allow_cancelled=allow_cancelled,
     )
     if result.returncode == 2:
         return None
@@ -516,7 +513,6 @@ def load_assignment(
     session_id: str,
     *,
     bind_worker: bool,
-    require_base_head: bool = True,
 ) -> Assignment:
     path = assignment_state_path(repo, assignment_id)
     if path.is_symlink() or not path.is_file():
@@ -598,13 +594,11 @@ def load_assignment(
         base=base,
         state=data,
     )
-    verify_assignment_state(assignment, require_base_head=require_base_head)
+    verify_assignment_state(assignment)
     return assignment
 
 
-def verify_assignment_state(
-    assignment: Assignment, *, require_base_head: bool = True
-) -> None:
+def verify_assignment_state(assignment: Assignment) -> None:
     worktree = assignment.worktree
     if not worktree.is_dir() or worktree.is_symlink():
         raise RequestError("派工工作樹不存在或不是一般目錄")
@@ -620,10 +614,7 @@ def verify_assignment_state(
         )
     if git_common_dir(worktree) != git_common_dir(assignment.coordinator_repo):
         raise RequestError("派工工作樹不屬於目前 Git repository")
-    if (
-        require_base_head
-        and git(worktree, "rev-parse", "HEAD").lower() != assignment.base.head_sha
-    ):
+    if git(worktree, "rev-parse", "HEAD").lower() != assignment.base.head_sha:
         raise RequestError("派工分支已有未經發布工具建立的提交")
     remote_url = git(worktree, "remote", "get-url", "--push", assignment.base.remote)
     if github_remote(remote_url) != (

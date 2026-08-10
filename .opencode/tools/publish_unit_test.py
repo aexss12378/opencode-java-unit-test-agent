@@ -8,7 +8,6 @@ import json
 import os
 import re
 import tempfile
-import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -39,24 +38,11 @@ from _unit_test_common import (
 )
 
 
-class RemoteStateUnknownError(RequestError):
-    """遠端操作已發出，但無法可靠判斷最後狀態。"""
-
-
 def github_locator(assignment: Assignment) -> str:
     base = assignment.base
     if base.github_host == "github.com":
         return base.github_repository
     return f"{base.github_host}/{base.github_repository}"
-
-
-def compare_url(assignment: Assignment) -> str:
-    base = urllib.parse.quote(assignment.base.remote_branch, safe="")
-    head = urllib.parse.quote(assignment.branch, safe="")
-    return (
-        f"https://{assignment.base.github_host}/{assignment.base.github_repository}/"
-        f"compare/{base}...{head}?expand=1"
-    )
 
 
 def validation_receipt(assignment: Assignment, validation_id: str) -> dict[str, Any]:
@@ -107,7 +93,7 @@ def verify_candidate_commit(
 ) -> None:
     project = assignment.worktree
     if git(project, "rev-parse", "HEAD").lower() != commit_sha:
-        raise RequestError("工作樹 HEAD 與發布狀態中的提交不一致")
+        raise RequestError("工作樹 HEAD 與候選提交不一致")
     if git(project, "rev-parse", "HEAD^").lower() != assignment.base.head_sha:
         raise RequestError("候選測試提交的父提交不是已驗證的 base SHA")
     require_only_path(
@@ -132,27 +118,9 @@ def verify_candidate_commit(
         raise RequestError("候選測試提交後仍有未提交變更")
 
 
-def create_or_reuse_commit(
-    assignment: Assignment,
-    receipt: dict[str, Any],
-    publication: dict[str, Any],
-) -> tuple[str, dict[str, Any]]:
+def commit_candidate(assignment: Assignment, receipt: dict[str, Any]) -> str:
     project = assignment.worktree
     digest = receipt["candidate_sha256"]
-    head = git(project, "rev-parse", "HEAD").lower()
-    recorded = publication.get("commit_sha")
-    if head != assignment.base.head_sha:
-        if recorded is not None and recorded != head:
-            raise RequestError("派工分支已有無法對帳的提交，需要人工確認")
-        verify_candidate_commit(assignment, head, digest)
-        publication = {**publication, "stage": "committed", "commit_sha": head}
-        state = dict(assignment.state)
-        state["status"] = "publishing"
-        state["publication"] = publication
-        save_assignment_state(assignment, state)
-        assignment.state.update(state)
-        return head, publication
-
     snapshot = candidate_snapshot(assignment, {}, require_cases=False)
     if snapshot["sha256"] != digest:
         raise RequestError("候選測試在驗證通過後又被修改，請重新驗證")
@@ -174,7 +142,6 @@ def create_or_reuse_commit(
         "--",
         message="候選測試未通過 git diff --check",
     )
-    title = f"新增 {assignment.target_class} 單元測試"
     git(
         project,
         "-c",
@@ -182,84 +149,40 @@ def create_or_reuse_commit(
         "commit",
         "--quiet",
         "-m",
-        title,
+        f"新增 {assignment.target_class} 單元測試",
         "-m",
         f"Candidate-SHA256: {digest}",
         message="無法建立候選測試提交",
     )
     commit_sha = git(project, "rev-parse", "HEAD").lower()
     verify_candidate_commit(assignment, commit_sha, digest)
-    publication = {**publication, "stage": "committed", "commit_sha": commit_sha}
-    state = dict(assignment.state)
-    state["status"] = "publishing"
-    state["publication"] = publication
-    save_assignment_state(assignment, state)
-    assignment.state.update(state)
-    return commit_sha, publication
+    return commit_sha
 
 
-def push_or_reconcile(
-    assignment: Assignment,
-    commit_sha: str,
-    publication: dict[str, Any],
-) -> dict[str, Any]:
+def push_branch(assignment: Assignment, commit_sha: str) -> str:
     project = assignment.worktree
-    observed = remote_sha(project, assignment.base.remote, assignment.branch)
-    if observed is not None and observed != commit_sha:
-        raise RequestError(
-            f"遠端派工分支指向其他提交：預期 {commit_sha}，實際 {observed}"
-        )
-    if observed is None:
-        pushed = run_command(
-            [
-                "git",
-                "-C",
-                str(project),
-                "push",
-                "--porcelain",
-                assignment.base.remote,
-                f"HEAD:refs/heads/{assignment.branch}",
-            ],
-            cwd=project,
-            timeout=GIT_TIMEOUT_SECONDS,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-        )
-        if pushed.returncode != 0:
-            try:
-                observed = remote_sha(
-                    project,
-                    assignment.base.remote,
-                    assignment.branch,
-                    allow_cancelled=True,
-                )
-            except RequestError as exc:
-                raise RemoteStateUnknownError(
-                    "推送沒有成功回覆，且無法重新查詢遠端分支；請人工確認後再重跑。"
-                ) from exc
-            if observed != commit_sha:
-                raise command_failure(pushed, f"無法推送分支 {assignment.branch}")
-    live_sha = remote_sha(
-        project,
-        assignment.base.remote,
-        assignment.branch,
-        allow_cancelled=True,
+    result = run_command(
+        [
+            "git",
+            "-C",
+            str(project),
+            "push",
+            "--porcelain",
+            assignment.base.remote,
+            f"HEAD:refs/heads/{assignment.branch}",
+        ],
+        cwd=project,
+        timeout=GIT_TIMEOUT_SECONDS,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
     )
+    if result.returncode != 0:
+        raise command_failure(result, f"無法推送分支 {assignment.branch}")
+    live_sha = remote_sha(project, assignment.base.remote, assignment.branch)
     if live_sha != commit_sha:
-        raise RemoteStateUnknownError(
-            f"推送後遠端 SHA 無法確認：預期 {commit_sha}，實際 {live_sha or '(不存在)'}"
+        raise RequestError(
+            f"推送後遠端 SHA 不一致：預期 {commit_sha}，實際 {live_sha or '(不存在)'}"
         )
-    publication = {
-        **publication,
-        "stage": "pushed",
-        "commit_sha": commit_sha,
-        "remote_sha": live_sha,
-    }
-    state = dict(assignment.state)
-    state["status"] = "publishing"
-    state["publication"] = publication
-    save_assignment_state(assignment, state)
-    assignment.state.update(state)
-    return publication
+    return live_sha
 
 
 def pr_body(
@@ -268,7 +191,7 @@ def pr_body(
     commit_sha: str,
 ) -> str:
     validation = receipt["result"]
-    case_sections = [
+    cases = [
         (
             f"### {case['id']}\n\n"
             f"- 情境：{case['scenario']}\n"
@@ -291,48 +214,12 @@ def pr_body(
         f"- 目標類別行覆蓋率：{validation['coverage']['percent']:.2f}%"
         f"（門檻 {validation['coverage']['minimum_percent']}%）\n\n"
         "## 測試案例與依據\n\n"
-        + "\n\n".join(case_sections)
+        + "\n\n".join(cases)
         + "\n\n---\n\n此 PR 必須由工程師審查；工具不會轉為 Ready，也不會合併。\n"
     )
     if len(body.encode("utf-8")) > MAX_PR_BODY_BYTES:
         raise RequestError(f"Draft PR 內容超過 {MAX_PR_BODY_BYTES} bytes")
     return body
-
-
-def list_existing_prs(assignment: Assignment) -> list[dict[str, Any]]:
-    result = run_command(
-        [
-            "gh",
-            "pr",
-            "list",
-            "--repo",
-            github_locator(assignment),
-            "--state",
-            "all",
-            "--head",
-            assignment.branch,
-            "--base",
-            assignment.base.remote_branch,
-            "--limit",
-            "10",
-            "--json",
-            "number,url,isDraft,state,headRefName,headRefOid,baseRefName",
-        ],
-        cwd=assignment.worktree,
-        timeout=GITHUB_TIMEOUT_SECONDS,
-        env=github_environment(),
-    )
-    if result.returncode != 0:
-        raise command_failure(result, "無法查詢既有 PR")
-    try:
-        values = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise RequestError("gh pr list 沒有回傳有效 JSON") from exc
-    if not isinstance(values, list) or any(
-        not isinstance(item, dict) for item in values
-    ):
-        raise RequestError("gh pr list 回傳格式無效")
-    return values
 
 
 def verify_pr(
@@ -357,16 +244,16 @@ def verify_pr(
     return details
 
 
-def create_pr(
+def create_draft_pr(
     assignment: Assignment,
     receipt: dict[str, Any],
     commit_sha: str,
-) -> None:
+) -> dict[str, Any]:
     body = pr_body(assignment, receipt, commit_sha)
     with tempfile.TemporaryDirectory(prefix="opencode-unit-test-pr-") as temporary:
         body_file = Path(temporary) / "body.md"
         body_file.write_text(body, encoding="utf-8")
-        result = run_command(
+        created = run_command(
             [
                 "gh",
                 "pr",
@@ -387,68 +274,36 @@ def create_pr(
             timeout=GITHUB_TIMEOUT_SECONDS,
             env=github_environment(),
         )
-    if result.returncode != 0:
-        raise command_failure(result, "gh pr create 沒有成功回覆")
-
-
-def create_or_reconcile_pr(
-    assignment: Assignment,
-    receipt: dict[str, Any],
-    commit_sha: str,
-) -> dict[str, Any]:
-    existing = list_existing_prs(assignment)
-    if len(existing) > 1:
-        raise RequestError("同一派工分支存在多個 PR，需要人工確認")
-    if not existing:
-        try:
-            create_pr(assignment, receipt, commit_sha)
-        except RequestError:
-            try:
-                existing = list_existing_prs(assignment)
-            except RequestError as query_error:
-                raise RemoteStateUnknownError(
-                    "建立 PR 沒有成功回覆，且無法重新查詢；請人工確認後再重跑。"
-                ) from query_error
-            if not existing:
-                raise
-        else:
-            try:
-                existing = list_existing_prs(assignment)
-            except RequestError as query_error:
-                raise RemoteStateUnknownError(
-                    "建立 PR 已成功回覆，但無法重新查詢驗證；請人工確認後再重跑。"
-                ) from query_error
-    if len(existing) != 1:
-        raise RemoteStateUnknownError("建立 PR 後沒有取得唯一可驗證結果")
-    return verify_pr(assignment, existing[0], commit_sha)
-
-
-def verify_published(
-    assignment: Assignment,
-    receipt: dict[str, Any],
-    publication: dict[str, Any],
-) -> dict[str, Any]:
-    commit_sha = publication.get("commit_sha")
-    pr = publication.get("pr")
-    if not isinstance(commit_sha, str) or not isinstance(pr, dict):
-        raise RequestError("已發布狀態不完整")
-    verify_candidate_commit(assignment, commit_sha, receipt["candidate_sha256"])
-    live_sha = remote_sha(
-        assignment.worktree, assignment.base.remote, assignment.branch
+    if created.returncode != 0:
+        raise command_failure(created, "無法建立 Draft PR")
+    urls = re.findall(r"https?://[^\s]+", created.stdout)
+    if not urls:
+        raise RequestError("gh pr create 沒有回傳 PR URL")
+    url = urls[-1].rstrip(".,)")
+    viewed = run_command(
+        [
+            "gh",
+            "pr",
+            "view",
+            url,
+            "--repo",
+            github_locator(assignment),
+            "--json",
+            "number,url,isDraft,state,headRefName,headRefOid,baseRefName",
+        ],
+        cwd=assignment.worktree,
+        timeout=GITHUB_TIMEOUT_SECONDS,
+        env=github_environment(),
     )
-    if live_sha != commit_sha:
-        raise RequestError("已發布分支的遠端 SHA 已改變")
-    matching = [
-        item
-        for item in list_existing_prs(assignment)
-        if item.get("url") == pr.get("url")
-    ]
-    if len(matching) != 1:
-        raise RequestError("找不到先前已驗證的 Draft PR")
-    details = verify_pr(assignment, matching[0], commit_sha)
-    return published_result(
-        assignment, receipt, commit_sha, live_sha, details, reused=True
-    )
+    if viewed.returncode != 0:
+        raise command_failure(viewed, "無法驗證新建 Draft PR")
+    try:
+        details = json.loads(viewed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RequestError("gh pr view 沒有回傳有效 JSON") from exc
+    if not isinstance(details, dict):
+        raise RequestError("gh pr view 回傳格式無效")
+    return verify_pr(assignment, details, commit_sha)
 
 
 def published_result(
@@ -457,16 +312,10 @@ def published_result(
     commit_sha: str,
     live_sha: str,
     pr: dict[str, Any],
-    *,
-    reused: bool,
 ) -> dict[str, Any]:
     return {
         "status": "draft-pr-created",
-        "message": (
-            "已重新核對既有提交、遠端分支與 Draft PR。"
-            if reused
-            else "候選測試已提交、推送，並建立等待人工審查的 Draft PR。"
-        ),
+        "message": "候選測試已提交、推送，並建立等待人工審查的 Draft PR。",
         "assignment_id": assignment.assignment_id,
         "validation_id": receipt["validation_id"],
         "target_class": assignment.target_class,
@@ -489,12 +338,6 @@ def published_result(
 
 def publish(assignment: Assignment, validation_id: str) -> dict[str, Any]:
     receipt = validation_receipt(assignment, validation_id)
-    publication = assignment.state.get("publication")
-    if not isinstance(publication, dict):
-        publication = {}
-    if assignment.state.get("status") == "published":
-        return verify_published(assignment, receipt, publication)
-
     require_remote_sha(
         assignment.worktree,
         assignment.base.remote,
@@ -502,8 +345,22 @@ def publish(assignment: Assignment, validation_id: str) -> dict[str, Any]:
         assignment.base.head_sha,
         "發布前",
     )
-    commit_sha, publication = create_or_reuse_commit(assignment, receipt, publication)
-    publication = push_or_reconcile(assignment, commit_sha, publication)
+    if (
+        remote_sha(assignment.worktree, assignment.base.remote, assignment.branch)
+        is not None
+    ):
+        raise RequestError(
+            f"遠端派工分支已存在：{assignment.base.remote}/{assignment.branch}"
+        )
+    commit_sha = commit_candidate(assignment, receipt)
+    require_remote_sha(
+        assignment.worktree,
+        assignment.base.remote,
+        assignment.base.remote_branch,
+        assignment.base.head_sha,
+        "推送前",
+    )
+    live_sha = push_branch(assignment, commit_sha)
     require_remote_sha(
         assignment.worktree,
         assignment.base.remote,
@@ -511,12 +368,7 @@ def publish(assignment: Assignment, validation_id: str) -> dict[str, Any]:
         assignment.base.head_sha,
         "建立 PR 前",
     )
-    pr = create_or_reconcile_pr(assignment, receipt, commit_sha)
-    live_sha = remote_sha(
-        assignment.worktree, assignment.base.remote, assignment.branch
-    )
-    if live_sha != commit_sha:
-        raise RequestError("PR 建立後遠端分支 SHA 與候選提交不一致")
+    pr = create_draft_pr(assignment, receipt, commit_sha)
     require_remote_sha(
         assignment.worktree,
         assignment.base.remote,
@@ -524,14 +376,10 @@ def publish(assignment: Assignment, validation_id: str) -> dict[str, Any]:
         assignment.base.head_sha,
         "PR 建立後",
     )
-    result = published_result(
-        assignment, receipt, commit_sha, live_sha, pr, reused=False
-    )
+    result = published_result(assignment, receipt, commit_sha, live_sha, pr)
     state = dict(assignment.state)
     state["status"] = "published"
     state["publication"] = {
-        **publication,
-        "stage": "published",
         "commit_sha": commit_sha,
         "remote_sha": live_sha,
         "pr": result["pr"],
@@ -558,30 +406,16 @@ def main() -> int:
             assignment_id,
             session_id,
             bind_worker=False,
-            require_base_head=False,
         )
         result = publish(assignment, validation_id)
         successful = result["status"] == "draft-pr-created"
     except (RequestError, OSError, UnicodeError) as exc:
-        unknown = isinstance(exc, RemoteStateUnknownError)
-        publication = assignment.state.get("publication") if assignment else None
-        submitted: bool | None = False
-        if isinstance(publication, dict) and publication.get("remote_sha"):
-            submitted = True
-        elif unknown:
-            submitted = None
         result = {
-            "status": "cancelled"
-            if cancelled()
-            else "remote-state-unknown"
-            if unknown
-            else "publication-failed",
+            "status": "cancelled" if cancelled() else "publication-failed",
             "message": str(exc),
-            "submitted": submitted,
-            "pr_created": None if unknown else False,
+            "submitted": False,
+            "pr_created": False,
             "merged": False,
-            "manual_recovery_required": unknown,
-            "automatic_retry_supported": True,
         }
         if assignment is not None:
             result.update(
@@ -595,7 +429,6 @@ def main() -> int:
                     "worktree_retained": True,
                     "branch": assignment.branch,
                     "base_sha": assignment.base.head_sha,
-                    "compare_url": compare_url(assignment),
                 }
             )
         successful = False
@@ -603,8 +436,8 @@ def main() -> int:
         result = {
             "status": "internal-error",
             "message": str(exc),
-            "submitted": None,
-            "pr_created": None,
+            "submitted": False,
+            "pr_created": False,
             "merged": False,
         }
         successful = False
