@@ -1,5 +1,6 @@
 target/
 .DS_Store
+unit-test-worktrees/
 .opencode/node_modules/
 .opencode/package-lock.json
 .opencode/bun.lock
