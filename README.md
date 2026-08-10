@@ -52,3 +52,15 @@
 ```
 
 應用程式預設監聽 `8080`，可透過 `server.port` 覆寫。
+
+## 以 OpenCode 建立所有 Service 單元測試
+
+先確認目前位於乾淨的 `main`，而且本機 `main`、追蹤分支及 GitHub 遠端 SHA 完全一致，接著在專案根目錄開啟 OpenCode 並輸入：
+
+```text
+/unit-test-all
+```
+
+此指令會盤點 `src/main/java` 中所有簡單類別名稱以 `Service` 結尾的具體頂層類別，並固定同時執行兩個 `unit-test` 子代理。每個具備可信規格證據的 Service 都使用獨立分支、Git worktree、測試檔與最多一個 Draft PR。
+
+缺少可信規格證據、規格彼此衝突或前置檢查失敗時，流程會如實列出原因，不會編造預期結果，也不會自行提交、暫存或捨棄工程師的既有變更。流程只建立並驗證 Draft PR，不會合併或轉為 Ready。
