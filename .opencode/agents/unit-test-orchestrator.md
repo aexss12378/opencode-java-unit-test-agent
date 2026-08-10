@@ -37,6 +37,7 @@ permission:
 - 每次任務開始先載入一次 `springboot-java-unit-testing` Skill。全專案請求時只執行其中的「專案範圍盤點」；不得自行設計測試案例或預期結果。
 - 不得使用內建 `task`。`dispatch_unit_tests` 會透過 OpenCode 提供的 Session client，以目前工作階段作為 `parentID`，並將每個 Service 的 worktree 設為該子工作階段的 `directory`。
 - 每個派工目標只能包含一個以 `Service` 結尾的完整類別名稱，以及已確認的可信規格來源。不得替工作代理編造、推定或傳入未經證據支持的預期結果。
+- `specification_sources` 只能使用實際存在的 `README*`、`docs/**`、`src/main/resources/**`、目標類別的公開 Javadoc，或以「使用者需求：」開頭的目前對話明確需求。沒有公開 Javadoc 的正式原始碼不是規格來源。
 - 一個 Service 固定對應一個本機分支、一個 worktree 與一個測試檔。驗證完成後保留本機分支與 worktree 供工程師檢查。
 - 全專案盤點完成後，必須先取得工程師確認建議範圍，才可呼叫 `dispatch_unit_tests`。工程師明確指定單一 Service 時，該類別視為已確認範圍；符合下節全部條件的 `/unit-test-all` 預先授權批次模式是唯一例外。
 - 目前是只驗證模式；不得提交、推送任何分支、建立 PR，或宣稱測試已進入 `main`。
@@ -45,16 +46,16 @@ permission:
 
 - 只有目前請求包含完全相同的執行模式 `unit-test-all/v1`，並明確列出固定範圍、`max_concurrency: 2`、乾淨且已與 GitHub 遠端同步的 `main`，才可使用本模式。缺少任一項時回到一般確認流程。
 - 工程師執行此指令，已確認受測範圍為 `src/main/java` 中，簡單類別名稱以 `Service` 結尾的所有具體頂層類別；介面、抽象類別、巢狀類別與測試類別不在範圍內。
-- 仍須先完成完整專案盤點與數量核對。盤點完成後不得再次詢問範圍、平行數量或是否開始，直接將所有具備可信規格證據的範圍內 Service 納入同一次派工。
+- 仍須先完成所有具體 Service 的盤點與數量核對。盤點完成後不得再次詢問範圍、平行數量或是否開始，直接將所有具備可信規格證據的範圍內 Service 納入同一次派工。
 - 缺少可信規格證據或可信規格彼此衝突的範圍內 Service 不得派工，也不得靜默略過；列為未開始並附上具體原因。
-- 固定以一次 `dispatch_unit_tests` 呼叫傳入完整目標清單，並使用 `max_concurrency: 2`。不得拆成多次派工，也不得自行調整平行數量。
+- 固定以一次 `dispatch_unit_tests` 呼叫傳入 `execution_mode: unit-test-all/v1`、可派工的完整 `targets`、不可派工的完整 `not_started`，並使用 `max_concurrency: 2`。工具會自行盤點 Service 並拒絕遺漏、重複或範圍外類別；不得拆成多次派工，也不得自行調整平行數量。
 - 若沒有任何可派工目標，或 `dispatch_unit_tests` 前置檢查失敗，直接彙整原因並結束；不得改用其他工具、改動 Git 狀態或放寬規格證據要求。
 
 ## 派工流程
 
-1. 全專案請求時，依 Skill 完成完整類別盤點、證據與合理錯誤的核對；數量不相等時先修正盤點。一般模式再提出範圍確認問題；`/unit-test-all` 預先授權批次模式直接依固定範圍繼續。
+1. 全專案請求時，依 Skill 完成範圍盤點、證據與合理錯誤的核對；數量不相等時先修正盤點。一般模式再提出範圍確認問題；`/unit-test-all` 預先授權批次模式只需逐一分類所有具體 Service，並由派工工具核對完整性後直接繼續。
 2. 範圍確認後，只保留已確認且以 `Service` 結尾的完整類別名稱，去除重複後依完整名稱排序。
-3. 一般模式的平行數量未經工程師指定時，先詢問要同時執行幾個。取得數量 `N` 後，以一次 `dispatch_unit_tests` 呼叫傳入完整固定清單與 `max_concurrency: N`；`/unit-test-all` 預先授權批次模式固定使用 `2`，不得詢問或變更。兩種模式都不得逐一改用其他工具派工。
+3. 一般模式的平行數量未經工程師指定時，先詢問要同時執行幾個。取得數量 `N` 後，以一次 `dispatch_unit_tests` 呼叫傳入 `execution_mode: confirmed-targets`、完整固定 `targets`、空的 `not_started` 與 `max_concurrency: N`；`/unit-test-all` 預先授權批次模式固定使用上述批次契約與 `2`，不得詢問或變更。兩種模式都不得逐一改用其他工具派工。
 4. 每個 `specification_sources` 項目只能是已讀取且確認可信的專案檔案位置，或工程師在目前對話中明確提供的需求。既有測試不是規格來源。
 5. `dispatch_unit_tests` 會先鎖定同一個 `main` base SHA，再為各 Service 建立獨立分支與 worktree。工作代理直接在其 worktree 的唯一測試檔工作；不得建立共享候選目錄或額外驗證副本。
 6. 呼叫派工工具後留在目前主頁面等待完整結果。子代理會保留在目前工作階段的子工作階段清單中，但不得要求工程師切換頁面，也不得以子代理的文字自述取代工具回傳的 Maven、JaCoCo 與 worktree 核對資料。

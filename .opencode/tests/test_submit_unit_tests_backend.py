@@ -71,12 +71,28 @@ class WorkflowRepositoryTest(unittest.TestCase):
         agent.write_text("---\nmode: subagent\n---\n", encoding="utf-8")
         source = self.repo / "src/main/java/com/example"
         source.mkdir(parents=True)
+        specifications = self.repo / "docs"
+        specifications.mkdir()
         for name in ["AlphaService", "BetaService", *[f"Service{index:02d}Service" for index in range(6)]]:
             (source / f"{name}.java").write_text(
                 f"package com.example; public class {name} {{}}\n",
                 encoding="utf-8",
             )
-        checked("add", "--", ".gitignore", ".opencode", "pom.xml", "mvnw", "src/main/java", cwd=self.repo)
+            (specifications / f"{name}.md").write_text(
+                f"# {name} 規格\n",
+                encoding="utf-8",
+            )
+        checked(
+            "add",
+            "--",
+            ".gitignore",
+            ".opencode",
+            "docs",
+            "pom.xml",
+            "mvnw",
+            "src/main/java",
+            cwd=self.repo,
+        )
         checked("commit", "-m", "initial", cwd=self.repo)
         checked("remote", "add", "origin", str(self.remote), cwd=self.repo)
         checked("push", "-u", "origin", "main", cwd=self.repo)
@@ -215,7 +231,10 @@ class WorkflowRepositoryTest(unittest.TestCase):
 
     def test_prepare_dispatch_creates_one_worktree_per_service(self) -> None:
         request = {
+            "execution_mode": "unit-test-all/v1",
             "targets": [self.target("AlphaService"), self.target("BetaService")],
+            "not_started": [],
+            "target_order": ["com.example.AlphaService", "com.example.BetaService"],
             "max_concurrency": 2,
         }
         with patch.object(backend, "base_context", return_value=self.base):
@@ -240,6 +259,117 @@ class WorkflowRepositoryTest(unittest.TestCase):
                 backend.Worktree(project.parent, project, item["branch"]),
                 delete_branch=True,
             )
+
+    def test_batch_dispatch_requires_every_concrete_service_to_be_classified(self) -> None:
+        not_started = [
+            {
+                "target_class": f"com.example.Service{index:02d}Service",
+                "reason": "缺少可信規格證據",
+            }
+            for index in range(6)
+        ]
+        not_started.append(
+            {
+                "target_class": "com.example.BetaService",
+                "reason": "可信規格彼此衝突",
+            }
+        )
+        result = backend.validate_dispatch_request(
+            self.repo,
+            {
+                "execution_mode": "unit-test-all/v1",
+                "targets": [
+                    {
+                        "target_class": "com.example.AlphaService",
+                        "specification_sources": ["docs/AlphaService.md"],
+                    }
+                ],
+                "not_started": not_started,
+                "max_concurrency": 2,
+            },
+        )
+
+        self.assertEqual(result["target_order"], backend.discover_concrete_services(self.repo))
+        self.assertEqual(len(result["targets"]), 1)
+        self.assertEqual(len(result["not_started"]), 7)
+
+    def test_batch_dispatch_accepts_every_service_as_not_started(self) -> None:
+        not_started = [
+            {
+                "target_class": target_class,
+                "reason": "缺少可信規格證據",
+            }
+            for target_class in backend.discover_concrete_services(self.repo)
+        ]
+        result = backend.validate_dispatch_request(
+            self.repo,
+            {
+                "execution_mode": "unit-test-all/v1",
+                "targets": [],
+                "not_started": not_started,
+                "max_concurrency": 2,
+            },
+        )
+
+        self.assertEqual(result["targets"], [])
+        self.assertEqual(result["target_order"], backend.discover_concrete_services(self.repo))
+        with patch.object(backend, "base_context", return_value=self.base):
+            prepared = backend.prepare_dispatch(self.repo, "session-no-workers", result)
+        self.assertEqual(prepared["status"], "prepared")
+        self.assertEqual(prepared["prepared"], [])
+        self.assertEqual(len(prepared["results"]), len(not_started))
+        self.assertTrue(all(item["status"] == "not-started" for item in prepared["results"]))
+
+    def test_batch_dispatch_rejects_missing_service_classification(self) -> None:
+        with self.assertRaisesRegex(backend.RequestError, "未分類"):
+            backend.validate_dispatch_request(
+                self.repo,
+                {
+                    "execution_mode": "unit-test-all/v1",
+                    "targets": [
+                        {
+                            "target_class": "com.example.AlphaService",
+                            "specification_sources": ["docs/AlphaService.md"],
+                        }
+                    ],
+                    "not_started": [],
+                    "max_concurrency": 2,
+                },
+            )
+
+    def test_dispatch_rejects_source_without_public_javadoc_as_specification(self) -> None:
+        with self.assertRaisesRegex(backend.RequestError, "沒有公開 Javadoc"):
+            backend.validate_dispatch_request(
+                self.repo,
+                {
+                    "execution_mode": "confirmed-targets",
+                    "targets": [
+                        {
+                            "target_class": "com.example.AlphaService",
+                            "specification_sources": [
+                                "src/main/java/com/example/AlphaService.java"
+                            ],
+                        }
+                    ],
+                    "not_started": [],
+                    "max_concurrency": 1,
+                },
+            )
+
+    def test_link_opencode_dependencies_keeps_scoped_parent_local(self) -> None:
+        source_modules = self.root / "source-modules"
+        plugin = source_modules / "@opencode-ai" / "plugin"
+        plugin.mkdir(parents=True)
+        (plugin / "package.json").write_text("{}\n", encoding="utf-8")
+        target_modules = self.root / "target-modules"
+
+        backend.link_opencode_dependencies(source_modules, target_modules)
+
+        target_scope = target_modules / "@opencode-ai"
+        self.assertTrue(target_scope.is_dir())
+        self.assertFalse(target_scope.is_symlink())
+        self.assertTrue((target_scope / "plugin").is_symlink())
+        self.assertEqual((target_scope / "plugin").resolve(), plugin.resolve())
 
     def test_assignment_binds_to_exact_child_session(self) -> None:
         worktree, assignment = self.prepare("session-bind", "AlphaService")

@@ -31,12 +31,21 @@ MINIMUM_LINE_COVERAGE_PERCENT = 80
 BRANCH_PREFIX = "opencode/unit-test"
 TRUSTED_BASE_BRANCH = "main"
 ASSIGNMENT_VERSION = 1
+BATCH_EXECUTION_MODE = "unit-test-all/v1"
+CONFIRMED_EXECUTION_MODE = "confirmed-targets"
+NOT_STARTED_REASONS = {"缺少可信規格證據", "可信規格彼此衝突"}
 CASE_ID = re.compile(r"^UT-[0-9]{3,}$")
 SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,200}$")
 JAVA_CLASS = re.compile(r"^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$")
 PACKAGE = re.compile(
     r"^\s*package\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*;",
     re.MULTILINE,
+)
+JAVA_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+JAVA_LINE_COMMENT = re.compile(r"//[^\r\n]*")
+PUBLIC_JAVADOC = re.compile(
+    r"/\*\*.*?\*/\s*(?:(?:@[A-Za-z_$][\w$]*(?:\([^)]*\))?)\s*)*(?:public|protected)\s+",
+    re.DOTALL,
 )
 _ACTIVE_PROCESSES: set[subprocess.Popen[str]] = set()
 _ACTIVE_PROCESSES_LOCK = threading.RLock()
@@ -308,10 +317,89 @@ def validate_target(repo: Path, target_class: str) -> dict[str, str]:
     }
 
 
+def discover_concrete_services(repo: Path) -> list[str]:
+    source_root = repo / "src" / "main" / "java"
+    if not source_root.is_dir():
+        raise RequestError("專案缺少 src/main/java，無法盤點 Service")
+    discovered: list[str] = []
+    for source in sorted(source_root.rglob("*Service.java")):
+        if source.is_symlink() or not source.is_file():
+            continue
+        try:
+            content = source.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise RequestError(f"無法讀取 Service 原始碼：{source.relative_to(repo)}") from exc
+        package_match = PACKAGE.search(content)
+        if package_match is None:
+            raise RequestError(f"Service 原始碼缺少 package：{source.relative_to(repo)}")
+        simple_name = source.stem
+        code = JAVA_LINE_COMMENT.sub("", JAVA_BLOCK_COMMENT.sub("", content))
+        declaration = re.search(
+            rf"(?m)(?:^|;)\s*(?:(?:@[A-Za-z_$][\w$]*(?:\([^)]*\))?)\s*)*"
+            rf"(?P<modifiers>(?:(?:public|abstract|final|sealed|non-sealed|strictfp)\s+)*)"
+            rf"class\s+{re.escape(simple_name)}\b",
+            code,
+        )
+        if declaration is None:
+            continue
+        modifiers = set(declaration.group("modifiers").split())
+        if "abstract" in modifiers:
+            continue
+        discovered.append(f"{package_match.group(1)}.{simple_name}")
+    return sorted(discovered)
+
+
+def normalize_specification_source(repo: Path, target: dict[str, str], value: str) -> str:
+    source = value.strip()
+    if source.startswith("使用者需求："):
+        requirement = source.removeprefix("使用者需求：").strip()
+        if not requirement:
+            raise RequestError(f"{target['target_class']} 的使用者需求不得為空")
+        return f"使用者需求：{requirement}"
+
+    candidate = Path(source)
+    source_path = candidate if candidate.is_absolute() else repo / candidate
+    resolved = source_path.resolve()
+    try:
+        relative = resolved.relative_to(repo.resolve())
+    except ValueError as exc:
+        raise RequestError(f"{target['target_class']} 的規格來源離開專案範圍：{source}") from exc
+    if source_path.is_symlink() or not resolved.is_file():
+        raise RequestError(f"{target['target_class']} 的規格來源不存在或不是一般檔案：{source}")
+    relative_posix = relative.as_posix()
+    allowed_document = (
+        (len(relative.parts) == 1 and relative.name.lower().startswith("readme"))
+        or relative.parts[:1] == ("docs",)
+        or relative.parts[:3] == ("src", "main", "resources")
+    )
+    if relative_posix == target["target_source"]:
+        try:
+            content = resolved.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise RequestError(f"無法讀取 {target['target_class']} 的 Javadoc 規格來源") from exc
+        if PUBLIC_JAVADOC.search(content) is None:
+            raise RequestError(
+                f"{target['target_class']} 的正式原始碼沒有公開 Javadoc，不得當成可信規格來源"
+            )
+    elif not allowed_document:
+        raise RequestError(
+            f"{target['target_class']} 的規格來源只允許 README、docs、src/main/resources、"
+            "目標類別公開 Javadoc或「使用者需求：...」"
+        )
+    return relative_posix
+
+
 def validate_dispatch_request(repo: Path, data: dict[str, Any]) -> dict[str, Any]:
+    execution_mode = data.get("execution_mode")
+    if execution_mode not in {BATCH_EXECUTION_MODE, CONFIRMED_EXECUTION_MODE}:
+        raise RequestError(
+            f"execution_mode 必須是 {BATCH_EXECUTION_MODE} 或 {CONFIRMED_EXECUTION_MODE}"
+        )
     raw_targets = data.get("targets")
-    if not isinstance(raw_targets, list) or not 1 <= len(raw_targets) <= MAX_TARGETS:
-        raise RequestError(f"targets 數量必須介於 1 到 {MAX_TARGETS}")
+    if not isinstance(raw_targets, list) or len(raw_targets) > MAX_TARGETS:
+        raise RequestError(f"targets 必須是最多 {MAX_TARGETS} 項的陣列")
+    if execution_mode == CONFIRMED_EXECUTION_MODE and not raw_targets:
+        raise RequestError("confirmed-targets 模式至少必須提供一個 target")
     max_concurrency = data.get("max_concurrency")
     if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int):
         raise RequestError("max_concurrency 必須是整數")
@@ -333,6 +421,7 @@ def validate_dispatch_request(repo: Path, data: dict[str, Any]) -> dict[str, Any
         raw_sources = raw.get("specification_sources")
         if not isinstance(raw_sources, list) or not 1 <= len(raw_sources) <= 20:
             raise RequestError(f"{target_class} 必須提供 1 到 20 個可信規格來源")
+        target = validate_target(repo, target_class)
         sources: list[str] = []
         for value in raw_sources:
             if not isinstance(value, str) or not value.strip():
@@ -340,10 +429,65 @@ def validate_dispatch_request(repo: Path, data: dict[str, Any]) -> dict[str, Any
             source = value.strip()
             if len(source) > 4_000:
                 raise RequestError(f"{target_class} 的單一可信規格來源不得超過 4000 字元")
-            sources.append(source)
-        targets.append({**validate_target(repo, target_class), "specification_sources": sources})
+            sources.append(normalize_specification_source(repo, target, source))
+        targets.append({**target, "specification_sources": sources})
     targets.sort(key=lambda item: item["target_class"])
-    return {"targets": targets, "max_concurrency": max_concurrency}
+
+    raw_not_started = data.get("not_started")
+    if not isinstance(raw_not_started, list) or len(raw_not_started) > MAX_TARGETS:
+        raise RequestError(f"not_started 必須是最多 {MAX_TARGETS} 項的陣列")
+    not_started: list[dict[str, str]] = []
+    for raw in raw_not_started:
+        if not isinstance(raw, dict):
+            raise RequestError("每個 not_started 項目都必須是物件")
+        target_class = raw.get("target_class")
+        reason = raw.get("reason")
+        if not isinstance(target_class, str) or not target_class.strip():
+            raise RequestError("not_started.target_class 不得為空")
+        target_class = target_class.strip()
+        if target_class in seen:
+            raise RequestError(f"Service 不得同時出現在 targets 與 not_started：{target_class}")
+        if reason not in NOT_STARTED_REASONS:
+            raise RequestError(
+                f"{target_class} 的 not_started.reason 必須是「缺少可信規格證據」或「可信規格彼此衝突」"
+            )
+        target = validate_target(repo, target_class)
+        seen.add(target_class)
+        not_started.append(
+            {
+                "target_class": target_class,
+                "test_file": target["test_file"],
+                "reason": reason,
+            }
+        )
+    not_started.sort(key=lambda item: item["target_class"])
+
+    if execution_mode == BATCH_EXECUTION_MODE:
+        if max_concurrency != 2:
+            raise RequestError("unit-test-all/v1 的 max_concurrency 必須固定為 2")
+        discovered = discover_concrete_services(repo)
+        classified = sorted(seen)
+        if classified != discovered:
+            missing = sorted(set(discovered) - set(classified))
+            unexpected = sorted(set(classified) - set(discovered))
+            detail: list[str] = []
+            if missing:
+                detail.append("未分類：" + ", ".join(missing))
+            if unexpected:
+                detail.append("不在固定範圍：" + ", ".join(unexpected))
+            raise RequestError("unit-test-all/v1 的 Service 分類不完整；" + "；".join(detail))
+        target_order = discovered
+    else:
+        if not_started:
+            raise RequestError("confirmed-targets 模式不得傳入 not_started")
+        target_order = [target["target_class"] for target in targets]
+    return {
+        "execution_mode": execution_mode,
+        "targets": targets,
+        "not_started": not_started,
+        "target_order": target_order,
+        "max_concurrency": max_concurrency,
+    }
 
 
 def assignment_digest(session_id: str, target_class: str, base_sha: str) -> str:
@@ -707,7 +851,15 @@ def link_opencode_dependencies(source_modules: Path, target_modules: Path) -> No
     target_modules.mkdir()
     for source in sorted(source_modules.iterdir(), key=lambda path: path.name):
         destination_path = target_modules / source.name
-        destination_path.symlink_to(source.resolve(), target_is_directory=source.is_dir())
+        if source.is_dir() and source.name.startswith("@"):
+            destination_path.mkdir()
+            for scoped_source in sorted(source.iterdir(), key=lambda path: path.name):
+                (destination_path / scoped_source.name).symlink_to(
+                    scoped_source.resolve(),
+                    target_is_directory=scoped_source.is_dir(),
+                )
+        else:
+            destination_path.symlink_to(source.resolve(), target_is_directory=source.is_dir())
 
 
 def prepare_assignment(
@@ -954,7 +1106,22 @@ def prepare_dispatch(repo: Path, session_id: str, request: dict[str, Any]) -> di
         }
 
     prepared: list[dict[str, Any]] = []
-    failures: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = [
+        {
+            "status": "not-started",
+            "message": item["reason"],
+            "target_class": item["target_class"],
+            "test_file": item["test_file"],
+            "base_sha": base.head_sha,
+            "submitted": False,
+            "pr_created": False,
+            "merged": False,
+            "manual_recovery_required": False,
+            "automatic_retry_supported": False,
+            "worktree_retained": False,
+        }
+        for item in request["not_started"]
+    ]
     for target in request["targets"]:
         try:
             require_remote_sha(repo, base.remote, base.remote_branch, base.head_sha, "建立 worktree 前")
@@ -985,15 +1152,26 @@ def prepare_dispatch(repo: Path, session_id: str, request: dict[str, Any]) -> di
                 }
             )
 
-    overall = "prepared" if len(prepared) == len(request["targets"]) else "partially-prepared" if prepared else "preparation-failed"
+    preparation_failures = len(failures) - len(request["not_started"])
+    overall = (
+        "prepared"
+        if len(prepared) == len(request["targets"])
+        else "partially-prepared"
+        if prepared
+        else "preparation-failed"
+    )
     return {
         "status": overall,
-        "message": f"{len(prepared)} 個 Service worktree 已準備，{len(failures)} 個未能準備。",
+        "message": (
+            f"{len(prepared)} 個 Service worktree 已準備，"
+            f"{len(request['not_started'])} 個因規格原因未開始，{preparation_failures} 個未能準備。"
+        ),
+        "execution_mode": request["execution_mode"],
         "base_branch": base.remote_branch,
         "base_sha": base.head_sha,
         "max_concurrency": request["max_concurrency"],
-        "service_count": len(request["targets"]),
-        "target_order": [target["target_class"] for target in request["targets"]],
+        "service_count": len(request["target_order"]),
+        "target_order": request["target_order"],
         "prepared": prepared,
         "results": failures,
     }

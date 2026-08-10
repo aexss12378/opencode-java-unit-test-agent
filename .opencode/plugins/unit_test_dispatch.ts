@@ -6,14 +6,19 @@ const sourceText = tool.schema
   .trim()
   .min(1)
   .max(4000)
-  .describe("可信規格檔案位置，或工程師在目前對話中明確提供的需求")
+  .describe(
+    "實際存在的 README、docs、src/main/resources、目標類別公開 Javadoc 檔案位置，或以「使用者需求：」開頭的目前對話明確需求",
+  )
 
 export const UnitTestDispatchPlugin: Plugin = async ({ client }) => ({
   tool: {
     dispatch_unit_tests: tool({
       description:
-        "由主代理為每個已確認的 Java Service 建立獨立本機分支與 Git worktree，並建立掛在目前主工作階段下的 unit-test 子代理。每個子代理的工作目錄固定為自己的 worktree；完成後彙整 Maven、JaCoCo 與保留的 worktree，不提交、不推送也不建立 PR。",
+        "核對完整 Service 分類與可信規格來源，再為每個可派工 Java Service 建立獨立本機分支、Git worktree 與 unit-test 子代理。完成後彙整 Maven、JaCoCo 與保留的 worktree，不提交、不推送也不建立 PR。",
       args: {
+        execution_mode: tool.schema
+          .enum(["unit-test-all/v1", "confirmed-targets"])
+          .describe("批次指令固定使用 unit-test-all/v1；人工確認的指定範圍使用 confirmed-targets"),
         targets: tool.schema
           .array(
             tool.schema.object({
@@ -27,8 +32,20 @@ export const UnitTestDispatchPlugin: Plugin = async ({ client }) => ({
                 .max(20),
             }),
           )
-          .min(1)
-          .max(50),
+          .max(50)
+          .describe("可派工的 Service；unit-test-all/v1 允許全部因規格原因未開始而傳入空陣列"),
+        not_started: tool.schema
+          .array(
+            tool.schema.object({
+              target_class: tool.schema
+                .string()
+                .trim()
+                .describe("固定範圍內因規格原因不派工的完整 Service 類別名稱"),
+              reason: tool.schema.enum(["缺少可信規格證據", "可信規格彼此衝突"]),
+            }),
+          )
+          .max(50)
+          .describe("unit-test-all/v1 必須列出每個不派工 Service；沒有時傳入空陣列"),
         max_concurrency: tool.schema
           .number()
           .int()

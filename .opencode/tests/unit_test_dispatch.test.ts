@@ -1,6 +1,10 @@
+import { mkdtemp, mkdir, realpath, rm, symlink } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { describe, expect, test } from "bun:test"
 import {
   dispatchUnitTests,
+  sameDirectory,
   type UnitTestBackendRunner,
 } from "../lib/unit_test_dispatch"
 
@@ -71,6 +75,21 @@ function backendFor(assignments: ReturnType<typeof prepared>) {
 }
 
 describe("unit-test 子工作階段分派", () => {
+  test("將符號連結別名視為同一個 worktree", async () => {
+    const root = await mkdtemp(join(tmpdir(), "unit-test-directory-"))
+    const actual = join(root, "actual")
+    const alias = join(root, "alias")
+    try {
+      await mkdir(actual)
+      await symlink(actual, alias, "dir")
+
+      expect(await sameDirectory(alias, actual)).toBeTrue()
+      expect(await realpath(alias)).toBe(await realpath(actual))
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   test("每個 Service 都以主工作階段為 parent 並使用自己的 worktree", async () => {
     const assignments = prepared(2)
     const { backend, calls: backendCalls } = backendFor(assignments)
@@ -108,10 +127,12 @@ describe("unit-test 子工作階段分派", () => {
     const result = await dispatchUnitTests(
       client as any,
       {
+        execution_mode: "unit-test-all/v1",
         targets: assignments.map((item) => ({
           target_class: item.target_class,
           specification_sources: ["docs/spec.md"],
         })),
+        not_started: [],
         max_concurrency: 2,
       },
       {
@@ -177,10 +198,12 @@ describe("unit-test 子工作階段分派", () => {
     const result = await dispatchUnitTests(
       client as any,
       {
+        execution_mode: "confirmed-targets",
         targets: assignments.map((item) => ({
           target_class: item.target_class,
           specification_sources: ["docs/spec.md"],
         })),
+        not_started: [],
         max_concurrency: 3,
       },
       {

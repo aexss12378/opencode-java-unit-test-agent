@@ -33,6 +33,8 @@ class UnitTestAllCommandTest(unittest.TestCase):
         self.assertEqual(metadata["subtask"], "false")
         self.assertIn("unit-test-all/v1", text)
         self.assertIn("`max_concurrency` 設為 `2`", text)
+        self.assertIn("`execution_mode: unit-test-all/v1`", text)
+        self.assertIn("`not_started`", text)
 
     def test_orchestrator_can_dispatch_only_after_fixed_batch_contract(self) -> None:
         text = ORCHESTRATOR.read_text(encoding="utf-8")
@@ -42,6 +44,8 @@ class UnitTestAllCommandTest(unittest.TestCase):
         self.assertIn("unit-test-all/v1", text)
         self.assertIn("`max_concurrency: 2`", text)
         self.assertIn("缺少可信規格證據", text)
+        self.assertIn("沒有公開 Javadoc 的正式原始碼不是規格來源", text)
+        self.assertIn("工具會自行盤點 Service", text)
 
     def test_worker_can_validate_but_cannot_submit(self) -> None:
         text = UNIT_TEST_AGENT.read_text(encoding="utf-8")

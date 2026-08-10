@@ -1,3 +1,4 @@
+import { realpath } from "node:fs/promises"
 import path from "node:path"
 import type { PluginInput } from "@opencode-ai/plugin"
 import {
@@ -10,8 +11,15 @@ export type DispatchTarget = {
   specification_sources: string[]
 }
 
+export type NotStartedTarget = {
+  target_class: string
+  reason: "缺少可信規格證據" | "可信規格彼此衝突"
+}
+
 export type DispatchArguments = {
+  execution_mode: "unit-test-all/v1" | "confirmed-targets"
   targets: DispatchTarget[]
+  not_started: NotStartedTarget[]
   max_concurrency: number
 }
 
@@ -111,6 +119,23 @@ function responseText(value: unknown): string {
     .map((part) => part.text as string)
     .join("\n")
     .slice(-4_000)
+}
+
+export async function sameDirectory(left: string, right: string): Promise<boolean> {
+  const resolvedLeft = path.resolve(left)
+  const resolvedRight = path.resolve(right)
+  if (resolvedLeft === resolvedRight) {
+    return true
+  }
+  try {
+    const [realLeft, realRight] = await Promise.all([
+      realpath(resolvedLeft),
+      realpath(resolvedRight),
+    ])
+    return realLeft === realRight
+  } catch {
+    return false
+  }
 }
 
 function verifiedValidationSuccess(result: Record<string, unknown>): boolean {
@@ -246,7 +271,7 @@ export async function dispatchUnitTests(
           if (child.parentID !== context.sessionID) {
             throw new Error("新工作階段沒有掛在目前主工作階段下")
           }
-          if (path.resolve(child.directory) !== path.resolve(assignment.worktree)) {
+          if (!(await sameDirectory(child.directory, assignment.worktree))) {
             throw new Error("新工作階段沒有使用派工指定的 worktree")
           }
           workerSessionID = child.id
