@@ -68,27 +68,14 @@ async function runBackend(
   }
 }
 
-const specificationSource = tool.schema
-  .string()
-  .trim()
-  .min(1)
-  .max(500)
-  .regex(/^(?:README[^/]*|docs\/.+|src\/main\/resources\/.+)$/i)
-  .describe("選填的外部規格檔案路徑；只接受 README、docs 或 src/main/resources")
-
 export default tool({
   description:
-    "完整核對所有具體 Service，再為每個 Service 建立獨立分支與專案內可見工作樹。外部規格可省略；只準備派工，不撰寫、驗證或發布測試。",
+    "為每個目標建立專案內可見的 detached Git worktree；不建立分支、不驗證或發布測試。",
   args: {
-    execution_mode: tool.schema.literal("unit-test-all/v2"),
     targets: tool.schema
       .array(
         tool.schema.object({
           target_class: tool.schema.string().trim().min(1),
-          specification_sources: tool.schema
-            .array(specificationSource)
-            .max(20)
-            .optional(),
         }),
       )
       .max(50),
