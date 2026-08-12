@@ -5,7 +5,6 @@ type BackendResult = { status?: string; [key: string]: unknown }
 
 async function runBackend(
   projectRoot: string,
-  sessionID: string,
   input: unknown,
   abort: AbortSignal,
 ): Promise<BackendResult> {
@@ -18,8 +17,6 @@ async function runBackend(
       path.join(import.meta.dir, "validate_unit_test.py"),
       "--repo",
       projectRoot,
-      "--session-id",
-      sessionID,
     ],
     {
       cwd: projectRoot,
@@ -73,9 +70,16 @@ const caseText = (description: string) =>
 
 export default tool({
   description:
-    "在派工指定的獨立工作樹中驗證唯一 Java 型別測試檔，核對 Maven、Surefire、JaCoCo 與內容雜湊，成功後產生發布用驗證憑證。",
+    "在 prepare 建立的 detached worktree 中驗證單一 Java 型別測試檔，核對 Maven、Surefire 與 JaCoCo。",
   args: {
-    assignment_id: tool.schema.string().regex(/^[0-9a-f]{24}$/),
+    target_class: tool.schema
+      .string()
+      .trim()
+      .regex(/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/),
+    worktree: tool.schema
+      .string()
+      .trim()
+      .regex(/^unit-test-worktrees\/[^/]+$/),
     test_cases: tool.schema
       .array(
         tool.schema.object({
@@ -96,7 +100,7 @@ export default tool({
       })
     }
     return JSON.stringify(
-      await runBackend(context.worktree, context.sessionID, args, context.abort),
+      await runBackend(context.worktree, args, context.abort),
     )
   },
 })

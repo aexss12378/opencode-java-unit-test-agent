@@ -5,7 +5,6 @@ type BackendResult = { status?: string; [key: string]: unknown }
 
 async function runBackend(
   projectRoot: string,
-  sessionID: string,
   input: unknown,
   abort: AbortSignal,
 ): Promise<BackendResult> {
@@ -18,8 +17,6 @@ async function runBackend(
       path.join(import.meta.dir, "publish_unit_test.py"),
       "--repo",
       projectRoot,
-      "--session-id",
-      sessionID,
     ],
     {
       cwd: projectRoot,
@@ -70,10 +67,16 @@ async function runBackend(
 
 export default tool({
   description:
-    "只發布最新 validate_unit_test 憑證綁定的候選測試。工具會提交、推送並建立 Draft PR；不會重試、轉為 Ready、合併或清理工作樹。",
+    "將 validate_unit_test 通過的候選測試建立分支、提交、推送並建立 Draft PR；不會轉為 Ready、合併或清理 worktree。",
   args: {
-    assignment_id: tool.schema.string().regex(/^[0-9a-f]{24}$/),
-    validation_id: tool.schema.string().regex(/^[0-9a-f]{24}$/),
+    target_class: tool.schema
+      .string()
+      .trim()
+      .regex(/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/),
+    worktree: tool.schema
+      .string()
+      .trim()
+      .regex(/^unit-test-worktrees\/[a-z0-9][a-z0-9-]*$/),
   },
   async execute(args, context) {
     if (context.agent !== "unit-test") {
@@ -83,7 +86,7 @@ export default tool({
       })
     }
     return JSON.stringify(
-      await runBackend(context.worktree, context.sessionID, args, context.abort),
+      await runBackend(context.worktree, args, context.abort),
     )
   },
 })
