@@ -93,12 +93,6 @@ export default tool({
       .max(50),
   },
   async execute(args, context) {
-    if (context.agent !== "unit-test") {
-      return JSON.stringify({
-        status: "blocked",
-        message: `validate_unit_test 只允許 unit-test 子代理使用，目前代理為 ${context.agent}`,
-      })
-    }
     return JSON.stringify(
       await runBackend(context.worktree, args, context.abort),
     )

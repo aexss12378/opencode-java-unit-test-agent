@@ -15,11 +15,7 @@ from typing import Any
 
 GIT_TIMEOUT_SECONDS = 120
 GITHUB_TIMEOUT_SECONDS = 120
-WORKTREE_DIRECTORY = "unit-test-worktrees"
 BRANCH_PREFIX = "opencode/unit-test"
-
-JAVA_CLASS = re.compile(r"^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$")
-WORKTREE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 _ACTIVE_PROCESS: subprocess.Popen[str] | None = None
 _CANCEL_REQUESTED = False
@@ -141,30 +137,6 @@ def git(repo: Path, *arguments: str, message: str = "Git 指令失敗") -> str:
     )
 
 
-def read_input() -> dict[str, Any]:
-    try:
-        data = json.load(sys.stdin)
-    except json.JSONDecodeError as exc:
-        raise RequestError(f"輸入不是有效 JSON：{exc}") from exc
-    if not isinstance(data, dict):
-        raise RequestError("輸入必須是 JSON 物件")
-    return data
-
-
-def required_string(data: dict[str, Any], key: str) -> str:
-    value = data.get(key)
-    if not isinstance(value, str) or not value.strip():
-        raise RequestError(f"缺少有效欄位：{key}")
-    return value.strip()
-
-
-def repo_root(value: str) -> Path:
-    repo = Path(value).resolve()
-    if repo != Path.cwd().resolve():
-        raise RequestError("--repo 必須指向目前工作目錄")
-    return repo
-
-
 def candidate_path(target_class: str) -> PurePosixPath:
     package, _, simple_name = target_class.rpartition(".")
     return PurePosixPath(
@@ -188,28 +160,11 @@ def upstream(repo: Path) -> tuple[str, str]:
 
 
 def load_publication(repo: Path, data: dict[str, Any]) -> Publication:
-    target_class = required_string(data, "target_class")
-    if JAVA_CLASS.fullmatch(target_class) is None:
-        raise RequestError(f"完整類別名稱格式無效：{target_class}")
-
-    relative = PurePosixPath(required_string(data, "worktree"))
-    if (
-        relative.is_absolute()
-        or len(relative.parts) != 2
-        or relative.parts[0] != WORKTREE_DIRECTORY
-        or WORKTREE_NAME.fullmatch(relative.parts[1]) is None
-    ):
-        raise RequestError("worktree 必須是 prepare 回傳的 unit-test-worktrees/<名稱>")
-    unresolved = repo.joinpath(*relative.parts)
-    if unresolved.is_symlink():
-        raise RequestError("worktree 不得是符號連結")
-    worktree = unresolved.resolve()
-    if not worktree.is_dir():
-        raise RequestError("worktree 不存在")
-
+    target_class = data["target_class"]
+    relative = PurePosixPath(data["worktree"])
     remote, base_branch = upstream(repo)
     return Publication(
-        worktree=worktree,
+        worktree=repo.joinpath(*relative.parts).resolve(),
         relative_worktree=relative.as_posix(),
         target_class=target_class,
         test_file=candidate_path(target_class).as_posix(),
@@ -330,8 +285,8 @@ def main() -> int:
     args = parser.parse_args()
     publication: Publication | None = None
     try:
-        repo = repo_root(args.repo)
-        publication = load_publication(repo, read_input())
+        repo = Path(args.repo).resolve()
+        publication = load_publication(repo, json.load(sys.stdin))
         result = publish(publication)
         successful = True
     except (RequestError, OSError, UnicodeError) as exc:

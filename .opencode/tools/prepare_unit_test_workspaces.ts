@@ -5,7 +5,6 @@ type BackendResult = { status?: string; [key: string]: unknown }
 
 async function runBackend(
   projectRoot: string,
-  sessionID: string,
   input: unknown,
   abort: AbortSignal,
 ): Promise<BackendResult> {
@@ -18,8 +17,6 @@ async function runBackend(
       path.join(import.meta.dir, "prepare_unit_test_workspaces.py"),
       "--repo",
       projectRoot,
-      "--session-id",
-      sessionID,
     ],
     {
       cwd: projectRoot,
@@ -81,14 +78,8 @@ export default tool({
       .max(50),
   },
   async execute(args, context) {
-    if (context.agent !== "unit-test-orchestrator") {
-      return JSON.stringify({
-        status: "blocked",
-        message: `prepare_unit_test_workspaces 只允許 unit-test-orchestrator 使用，目前代理為 ${context.agent}`,
-      })
-    }
     return JSON.stringify(
-      await runBackend(context.worktree, context.sessionID, args, context.abort),
+      await runBackend(context.worktree, args, context.abort),
     )
   },
 })

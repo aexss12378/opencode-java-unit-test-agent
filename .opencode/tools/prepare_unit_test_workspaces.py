@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -11,6 +10,7 @@ import signal
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -109,40 +109,20 @@ def repo_root(value: str) -> Path:
     wrapper = repo / "mvnw"
     if not wrapper.is_file() or not os.access(wrapper, os.X_OK):
         raise RequestError("專案根目錄需要可執行的 mvnw")
-    top = git(repo, "rev-parse", "--show-toplevel", message="目前目錄不是 Git worktree")
-    if Path(top).resolve() != repo:
-        raise RequestError("--repo 必須指向 Git worktree 根目錄")
     return repo
 
 
 def read_targets() -> list[str]:
-    try:
-        data = json.load(sys.stdin)
-        raw_targets = data["targets"]
-    except (json.JSONDecodeError, KeyError, TypeError) as exc:
-        raise RequestError("輸入必須包含 targets 陣列") from exc
-    if not isinstance(raw_targets, list):
-        raise RequestError("targets 必須是陣列")
-    targets: list[str] = []
-    for raw in raw_targets:
-        if not isinstance(raw, dict):
-            raise RequestError("每個目標都必須是物件")
-        target_class = raw.get("target_class")
-        if not isinstance(target_class, str) or not target_class.strip():
-            raise RequestError("每個目標都需要 target_class")
-        targets.append(target_class.strip())
+    targets = [target["target_class"] for target in json.load(sys.stdin)["targets"]]
     if len(targets) != len(set(targets)):
         raise RequestError("target_class 不得重複")
     return targets
 
 
-def worktree_path(repo: Path, session_id: str, target_class: str) -> tuple[Path, str]:
+def worktree_path(repo: Path, target_class: str) -> tuple[Path, str]:
     simple_name = target_class.rsplit(".", 1)[-1]
     slug = re.sub(r"[^a-z0-9]+", "-", simple_name.lower()).strip("-") or "test"
-    suffix = hashlib.sha256(
-        f"{session_id}\0{target_class}".encode("utf-8")
-    ).hexdigest()[:8]
-    relative = f"{WORKTREE_DIRECTORY}/{slug}-{suffix}"
+    relative = f"{WORKTREE_DIRECTORY}/{slug}-{uuid.uuid4()}"
     return repo / relative, relative
 
 
@@ -156,12 +136,11 @@ def remove_worktree(repo: Path, worktree: Path) -> None:
         shutil.rmtree(worktree, ignore_errors=True)
 
 
-def prepare(repo: Path, session_id: str, targets: list[str]) -> dict[str, Any]:
+def prepare(repo: Path, targets: list[str]) -> dict[str, Any]:
     status = git(repo, "status", "--porcelain=v1", "--untracked-files=all")
     if status:
         preview = "；".join(status.splitlines()[:5])
         raise RequestError(f"建立工作樹前，主工作目錄必須乾淨：{preview}")
-    base_sha = git(repo, "rev-parse", "HEAD", message="無法取得目前 Git 提交")
     ignored = run_command(
         ["git", "-C", str(repo), "check-ignore", "-q", f"{WORKTREE_DIRECTORY}/example"],
         cwd=repo,
@@ -170,15 +149,10 @@ def prepare(repo: Path, session_id: str, targets: list[str]) -> dict[str, Any]:
         raise RequestError(f".gitignore 必須排除 {WORKTREE_DIRECTORY}/")
 
     root = repo / WORKTREE_DIRECTORY
-    if root.is_symlink():
-        raise RequestError(f"{WORKTREE_DIRECTORY} 不得是符號連結")
     planned = [
-        (target_class, *worktree_path(repo, session_id, target_class))
+        (target_class, *worktree_path(repo, target_class))
         for target_class in targets
     ]
-    conflicts = [str(path) for _, path, _ in planned if path.exists()]
-    if conflicts:
-        raise RequestError("工作樹路徑已存在：" + "、".join(conflicts))
     if planned:
         root.mkdir(parents=True, exist_ok=True)
 
@@ -195,7 +169,7 @@ def prepare(repo: Path, session_id: str, targets: list[str]) -> dict[str, Any]:
                     "--detach",
                     "--quiet",
                     str(worktree),
-                    base_sha,
+                    "HEAD",
                 ],
                 cwd=repo,
             )
@@ -209,8 +183,6 @@ def prepare(repo: Path, session_id: str, targets: list[str]) -> dict[str, Any]:
         raise
 
     return {
-        "status": "prepared",
-        "base_sha": base_sha,
         "worktrees": [
             {"target_class": target_class, "worktree": relative}
             for target_class, _, relative in planned
@@ -223,10 +195,9 @@ def main() -> int:
     signal.signal(signal.SIGINT, request_cancellation)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", default=".")
-    parser.add_argument("--session-id", required=True)
     args = parser.parse_args()
     try:
-        result = prepare(repo_root(args.repo), args.session_id, read_targets())
+        result = prepare(repo_root(args.repo), read_targets())
         successful = True
     except (RequestError, OSError, UnicodeError) as exc:
         result = {
