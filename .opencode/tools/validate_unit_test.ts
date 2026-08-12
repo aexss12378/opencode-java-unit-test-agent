@@ -73,7 +73,7 @@ const caseText = (description: string) =>
 
 export default tool({
   description:
-    "在派工指定的獨立工作樹中驗證唯一 Service 測試檔，核對 Maven、Surefire、JaCoCo 與內容雜湊，成功後產生發布用驗證憑證。",
+    "在派工指定的獨立工作樹中驗證唯一 Java 型別測試檔，核對 Maven、Surefire、JaCoCo 與內容雜湊，成功後產生發布用驗證憑證。",
   args: {
     assignment_id: tool.schema.string().regex(/^[0-9a-f]{24}$/),
     test_cases: tool.schema
