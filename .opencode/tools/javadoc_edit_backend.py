@@ -30,7 +30,7 @@ class GateError(Exception):
 
 @dataclass(frozen=True)
 class Addition:
-    target_line: int
+    start_byte: int
     javadoc: str
 
 
@@ -48,7 +48,7 @@ def main() -> None:
     except GateError as error:
         guidance = f"{error}；沒有寫入任何檔案"
         if error.retryable:
-            guidance += "。請重新讀取該 Java 檔案，修正 Javadoc 內文或目標行號後再提交"
+            guidance += "。請重新掃描該 Java 檔案，修正 Javadoc 內文或 start_byte 後再提交"
         result = {
             "status": "blocked",
             "message": guidance,
@@ -98,15 +98,15 @@ def read_request() -> tuple[str, list[Addition]]:
     for item in raw_additions:
         if not isinstance(item, dict):
             raise GateError("Javadoc 新增資料必須是物件")
-        target_line = item.get("target_line")
+        start_byte = item.get("start_byte")
         javadoc = item.get("javadoc")
-        if isinstance(target_line, bool) or not isinstance(target_line, int):
-            raise GateError("目標行號必須是整數")
-        if target_line < 1:
-            raise GateError("目標行號必須大於 0")
+        if isinstance(start_byte, bool) or not isinstance(start_byte, int):
+            raise GateError("start_byte 必須是整數")
+        if start_byte < 0:
+            raise GateError("start_byte 不得小於 0")
         if not isinstance(javadoc, str):
             raise GateError("Javadoc 內文必須是字串")
-        additions.append(Addition(target_line, normalize_javadoc(javadoc)))
+        additions.append(Addition(start_byte, normalize_javadoc(javadoc)))
     return raw_path, additions
 
 
@@ -124,41 +124,41 @@ def apply(
 
     parser = Parser(Language(tree_sitter_java.language()))
     before_tree = parse_java(parser, before_bytes)
-    declarations = declarations_by_line(before_tree.root_node)
+    declarations = declarations_by_start_byte(before_tree.root_node)
     newline = b"\r\n" if b"\r\n" in before_bytes else b"\n"
-    requested_lines: set[int] = set()
+    requested_start_bytes: set[int] = set()
     insertions: list[Insertion] = []
 
     for addition in additions:
-        if addition.target_line in requested_lines:
+        if addition.start_byte in requested_start_bytes:
             raise GateError(
-                f"第 {addition.target_line} 行被重複提交",
+                f"start_byte {addition.start_byte} 被重複提交",
                 retryable=True,
             )
-        requested_lines.add(addition.target_line)
+        requested_start_bytes.add(addition.start_byte)
 
-        matches = declarations.get(addition.target_line, [])
+        matches = declarations.get(addition.start_byte, [])
         if len(matches) != 1:
             raise GateError(
-                f"第 {addition.target_line} 行不是唯一且可新增 Javadoc 的 Java 宣告",
+                f"start_byte {addition.start_byte} 不是唯一且可新增 Javadoc 的 Java 宣告",
                 retryable=True,
             )
         declaration = matches[0]
         if has_javadoc(declaration, before_bytes):
             raise GateError(
-                f"第 {addition.target_line} 行的宣告已經有 Javadoc",
+                f"start_byte {addition.start_byte} 的宣告已經有 Javadoc",
                 retryable=True,
             )
 
-        line_start = before_bytes.rfind(b"\n", 0, declaration.start_byte) + 1
-        indentation = before_bytes[line_start : declaration.start_byte]
+        indentation_start = declaration.start_byte - declaration.start_point.column
+        indentation = before_bytes[indentation_start : declaration.start_byte]
         if any(value not in (ord(" "), ord("\t")) for value in indentation):
             raise GateError(
-                f"第 {addition.target_line} 行不是獨立的宣告起始行",
+                f"start_byte {addition.start_byte} 的宣告不是獨立行的起始內容",
             )
         insertions.append(
             Insertion(
-                line_start,
+                declaration.start_byte,
                 render_javadoc(indentation, addition.javadoc, newline),
             )
         )
@@ -187,7 +187,7 @@ def apply(
         "status": "published",
         "path": raw_path,
         "added": len(additions),
-        "target_lines": sorted(requested_lines),
+        "start_bytes": sorted(requested_start_bytes),
         "written": True,
     }
 
@@ -235,12 +235,11 @@ def walk(node: Node):
         yield from walk(child)
 
 
-def declarations_by_line(root: Node) -> dict[int, list[Node]]:
+def declarations_by_start_byte(root: Node) -> dict[int, list[Node]]:
     declarations: dict[int, list[Node]] = {}
     for node in walk(root):
         if is_documentable_declaration(node):
-            line = node.start_point.row + 1
-            declarations.setdefault(line, []).append(node)
+            declarations.setdefault(node.start_byte, []).append(node)
     return declarations
 
 
@@ -303,13 +302,13 @@ def normalize_javadoc(value: str) -> str:
 
 
 def render_javadoc(indentation: bytes, body: str, newline: bytes) -> bytes:
-    rendered = bytearray(indentation + b"/**" + newline)
+    rendered = bytearray(b"/**" + newline)
     for line in body.split("\n"):
         rendered.extend(indentation + b" *")
         if line:
             rendered.extend(b" " + line.encode("utf-8"))
         rendered.extend(newline)
-    rendered.extend(indentation + b" */" + newline)
+    rendered.extend(indentation + b" */" + newline + indentation)
     return bytes(rendered)
 
 

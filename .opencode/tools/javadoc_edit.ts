@@ -16,7 +16,7 @@ async function runBackend(
   projectRoot: string,
   input: {
     path: string
-    additions: Array<{ target_line: number; javadoc: string }>
+    additions: Array<{ start_byte: number; javadoc: string }>
   },
 ): Promise<BackendResult> {
   const backend = path.join(import.meta.dir, "javadoc_edit_backend.py")
@@ -62,7 +62,7 @@ async function runBackend(
 
 export default tool({
   description:
-    "只在既有 src/main/java/**/*.java 宣告前新增 Javadoc。每次處理一個檔案；target_line 必須是目前檔案中類別、介面、enum、record、方法、建構子或欄位宣告的第一行（有 annotation 時使用第一個 annotation 的行號）。已有 Javadoc、非宣告位置、其他路徑或無法安全解析的變更都會拒絕。",
+    "只在既有 src/main/java/**/*.java 宣告前新增 Javadoc。每次處理一個檔案；start_byte 必須是 Tree-sitter 掃描目前檔案後回傳的宣告起始位元組。已有 Javadoc、非宣告位置、其他路徑或無法安全解析的變更都會拒絕。",
   args: {
     path: tool.schema
       .string()
@@ -71,11 +71,11 @@ export default tool({
     additions: tool.schema
       .array(
         tool.schema.object({
-          target_line: tool.schema
+          start_byte: tool.schema
             .number()
             .int()
-            .positive()
-            .describe("目前檔案中目標宣告第一行的 1-based 行號"),
+            .nonnegative()
+            .describe("Tree-sitter 掃描目前檔案後回傳的宣告 start_byte"),
           javadoc: javadocText,
         }),
       )
