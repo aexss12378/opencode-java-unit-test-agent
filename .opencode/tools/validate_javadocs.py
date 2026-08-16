@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -48,11 +49,16 @@ class ValidationError(RuntimeError):
 
 @dataclass(frozen=True)
 class Declaration:
+    kind: str
     name: str
     line: int
     start: int
     javadoc_start: int | None
+    javadoc_end: int | None
     required: bool
+    parameters: tuple[str, ...]
+    type_parameters: tuple[str, ...]
+    returns_value: bool
 
     @property
     def has_javadoc(self) -> bool:
@@ -60,7 +66,12 @@ class Declaration:
 
 
 def command(
-    arguments: list[str], *, cwd: Path, message: str, timeout: int = 120
+    arguments: list[str],
+    *,
+    cwd: Path,
+    message: str,
+    timeout: int = 120,
+    environment: dict[str, str] | None = None,
 ) -> str:
     try:
         result = subprocess.run(
@@ -72,6 +83,7 @@ def command(
             errors="replace",
             timeout=timeout,
             check=False,
+            env=environment,
         )
     except FileNotFoundError as error:
         raise ValidationError(f"找不到必要指令：{arguments[0]}") from error
@@ -85,6 +97,28 @@ def command(
 
 def git(repo: Path, *arguments: str, message: str = "Git 指令失敗") -> str:
     return command(["git", "-C", str(repo), *arguments], cwd=repo, message=message)
+
+
+def maven_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    configured = environment.get("JAVA_HOME")
+    if configured:
+        home = Path(configured)
+        if os.access(home / "bin/java", os.X_OK) and os.access(
+            home / "bin/javac", os.X_OK
+        ):
+            return environment
+
+    java = shutil.which("java")
+    javac = shutil.which("javac")
+    if java and javac:
+        java_home = Path(java).resolve().parent.parent
+        if (
+            os.access(java_home / "bin/java", os.X_OK)
+            and os.access(java_home / "bin/javac", os.X_OK)
+        ):
+            environment["JAVA_HOME"] = str(java_home)
+    return environment
 
 
 def normalize_path(value: str) -> str:
@@ -204,6 +238,19 @@ def declaration_name(node: Node, source: bytes) -> str:
     return node.type
 
 
+def declaration_line(node: Node) -> int:
+    name = node.child_by_field_name("name")
+    if name is not None:
+        return name.start_point.row + 1
+    if node.type in ("field_declaration", "constant_declaration"):
+        for item in walk(node):
+            if item.type == "variable_declarator":
+                name = item.child_by_field_name("name")
+                if name is not None:
+                    return name.start_point.row + 1
+    return node.start_point.row + 1
+
+
 def visible_type(node: Node, source: bytes) -> bool:
     parent_type = nearest_type(node)
     value = modifiers(node, source)
@@ -259,21 +306,120 @@ def scan(source: bytes, path: str) -> list[Declaration]:
             continue
         previous = node.prev_named_sibling
         javadoc_start = None
+        javadoc_end = None
         if previous is not None and previous.type == "block_comment":
             raw = source[previous.start_byte : previous.end_byte]
             gap = source[previous.end_byte : node.start_byte]
             if raw.startswith(b"/**") and not gap.strip():
                 javadoc_start = previous.start_byte
+                javadoc_end = previous.end_byte
+        parameters_node = node.child_by_field_name("parameters")
+        parameters = (
+            tuple(
+                text(parameter.child_by_field_name("name"), source)
+                for parameter in parameters_node.named_children
+                if parameter.child_by_field_name("name") is not None
+            )
+            if parameters_node is not None and node.type != "record_declaration"
+            else ()
+        )
+        type_parameters_node = node.child_by_field_name("type_parameters")
+        type_parameters = (
+            tuple(
+                text(parameter.child_by_field_name("name"), source)
+                for parameter in type_parameters_node.named_children
+                if parameter.child_by_field_name("name") is not None
+            )
+            if type_parameters_node is not None
+            else ()
+        )
+        return_type = node.child_by_field_name("type")
         declarations.append(
             Declaration(
+                kind=node.type,
                 name=declaration_name(node, source),
-                line=node.start_point.row + 1,
+                line=declaration_line(node),
                 start=node.start_byte,
                 javadoc_start=javadoc_start,
+                javadoc_end=javadoc_end,
                 required=required(node, source, filename),
+                parameters=parameters,
+                type_parameters=type_parameters,
+                returns_value=(
+                    node.type
+                    in ("method_declaration", "annotation_type_element_declaration")
+                    and return_type is not None
+                    and text(return_type, source) != "void"
+                ),
             )
         )
     return declarations
+
+
+def validate_javadoc_quality(
+    source: bytes, path: str, declarations: list[Declaration]
+) -> None:
+    for declaration in declarations:
+        if not declaration.has_javadoc:
+            continue
+        assert declaration.javadoc_start is not None
+        assert declaration.javadoc_end is not None
+        raw = source[declaration.javadoc_start : declaration.javadoc_end].decode("utf-8")
+        if re.search(r"(?m)^[ \t]*\*[ \t]+\*", raw):
+            raise ValidationError(
+                f"{path} 的 {declaration.name}@{declaration.line} Javadoc 含多餘開頭星號"
+            )
+        if "{@inheritDoc}" in raw:
+            continue
+        body = raw[3:-2]
+        description_lines = []
+        for line in body.splitlines():
+            content = re.sub(r"^[ \t]*\*[ \t]?", "", line)
+            if re.match(r"^[ \t]*@[A-Za-z]+\b", content):
+                break
+            description_lines.append(content)
+        if not "".join(description_lines).strip():
+            raise ValidationError(
+                f"{path} 的 {declaration.name}@{declaration.line} Javadoc 缺少主要說明"
+            )
+        documented = set(
+            re.findall(
+                r"(?m)^[ \t]*\*[ \t]+@param[ \t]+([A-Za-z_$][\w$]*)\b",
+                raw,
+            )
+        )
+        missing = [
+            parameter
+            for parameter in declaration.parameters
+            if parameter not in documented
+        ]
+        if missing:
+            raise ValidationError(
+                f"{path} 的 {declaration.name}@{declaration.line} "
+                f"缺少參數 @param：{missing}"
+            )
+        documented_types = set(
+            re.findall(
+                r"(?m)^[ \t]*\*[ \t]+@param[ \t]+<([A-Za-z_$][\w$]*)>",
+                raw,
+            )
+        )
+        missing_types = [
+            parameter
+            for parameter in declaration.type_parameters
+            if parameter not in documented_types
+        ]
+        if missing_types:
+            raise ValidationError(
+                f"{path} 的 {declaration.name}@{declaration.line} "
+                f"缺少型別參數 @param：{missing_types}"
+            )
+        if declaration.returns_value and not re.search(
+            r"(?m)^[ \t]*\*[ \t]+@return\b", raw
+        ):
+            raise ValidationError(
+                f"{path} 的 {declaration.name}@{declaration.line} 缺少 @return"
+            )
 
 
 def without_javadocs(source: bytes, path: str) -> bytes:
@@ -319,50 +465,77 @@ def validate(repo: Path, payload: dict[str, Any]) -> dict[str, Any]:
         raise ValidationError(f"尚未回報所有檔案：{sorted(expected - set(outcomes))[:10]}")
 
     failed, blocked_report, completed = [], [], set()
+
+    def reject_file(path: str, reason: str) -> None:
+        git(
+            worktree,
+            "restore",
+            "--source",
+            state["base_sha"],
+            "--",
+            path,
+            message=f"無法還原未完成檔案：{path}",
+        )
+        failed.append({"path": path, "reason": reason})
+
     for path, outcome in outcomes.items():
         if outcome["status"] == "failed":
-            git(
-                worktree,
-                "restore",
-                "--source",
-                state["base_sha"],
-                "--",
-                path,
-                message=f"無法還原未完成檔案：{path}",
-            )
-            failed.append({"path": path, "reason": outcome["message"] or "逐檔子代理未完成"})
+            reject_file(path, outcome["message"] or "逐檔子代理未完成")
+            continue
+        try:
+            source = (worktree / path).read_bytes()
+            declarations = scan(source, path)
+            validate_javadoc_quality(source, path, declarations)
+            blocked_identities = set()
+            file_blocked = []
+            for conflict in outcome["blocked"]:
+                if not isinstance(conflict, dict):
+                    raise ValidationError(f"{path} 的衝突宣告格式不正確")
+                line, name, reason = (
+                    conflict.get("line"),
+                    conflict.get("name"),
+                    conflict.get("reason"),
+                )
+                if (
+                    not isinstance(line, int)
+                    or not isinstance(name, str)
+                    or not str(reason).strip()
+                ):
+                    raise ValidationError(f"{path} 的衝突宣告缺少 line、name 或 reason")
+                if not any(
+                    item.line == line and item.name == name for item in declarations
+                ):
+                    raise ValidationError(f"{path} 找不到第 {line} 行宣告 {name}")
+                blocked_identities.add((line, name))
+                file_blocked.append(
+                    {
+                        "path": path,
+                        "line": line,
+                        "name": name,
+                        "reason": str(reason).strip(),
+                    }
+                )
+            missing = [
+                item
+                for item in declarations
+                if item.required
+                and not item.has_javadoc
+                and (item.line, item.name) not in blocked_identities
+            ]
+            if missing:
+                raise ValidationError(
+                    f"{path} 仍有必要宣告缺少 Javadoc："
+                    f"{[f'{item.name}@{item.line}' for item in missing[:10]]}"
+                )
+            if without_javadocs(
+                git_blob(worktree, state["base_sha"], path), path
+            ) != without_javadocs(source, path):
+                raise ValidationError(f"{path} 含 Javadoc 以外的變更")
+        except (ValidationError, OSError) as error:
+            reject_file(path, f"檔案驗證失敗：{error}")
             continue
         completed.add(path)
-        declarations = scan((worktree / path).read_bytes(), path)
-        blocked_identities = set()
-        for conflict in outcome["blocked"]:
-            if not isinstance(conflict, dict):
-                raise ValidationError(f"{path} 的衝突宣告格式不正確")
-            line, name, reason = (
-                conflict.get("line"),
-                conflict.get("name"),
-                conflict.get("reason"),
-            )
-            if not isinstance(line, int) or not isinstance(name, str) or not str(reason).strip():
-                raise ValidationError(f"{path} 的衝突宣告缺少 line、name 或 reason")
-            if not any(item.line == line and item.name == name for item in declarations):
-                raise ValidationError(f"{path} 找不到第 {line} 行宣告 {name}")
-            blocked_identities.add((line, name))
-            blocked_report.append(
-                {"path": path, "line": line, "name": name, "reason": str(reason).strip()}
-            )
-        missing = [
-            item
-            for item in declarations
-            if item.required
-            and not item.has_javadoc
-            and (item.line, item.name) not in blocked_identities
-        ]
-        if missing:
-            raise ValidationError(
-                f"{path} 仍有必要宣告缺少 Javadoc："
-                f"{[f'{item.name}@{item.line}' for item in missing[:10]]}"
-            )
+        blocked_report.extend(file_blocked)
 
     changed = [
         line
@@ -374,11 +547,6 @@ def validate(repo: Path, payload: dict[str, Any]) -> dict[str, Any]:
     unexpected = [path for path in changed if path not in completed]
     if unexpected:
         raise ValidationError(f"發現範圍外變更：{unexpected[:10]}")
-    for path in changed:
-        if without_javadocs(git_blob(worktree, state["base_sha"], path), path) != without_javadocs(
-            (worktree / path).read_bytes(), path
-        ):
-            raise ValidationError(f"{path} 含 Javadoc 以外的變更")
     git(
         worktree,
         "diff",
@@ -391,7 +559,14 @@ def validate(repo: Path, payload: dict[str, Any]) -> dict[str, Any]:
 
     maven = ["./mvnw"] if (worktree / "mvnw").is_file() and os.access(worktree / "mvnw", os.X_OK) else ["mvn"]
     arguments = [*maven, "-B", "-ntp", "-DskipTests", "compile"]
-    output = command(arguments, cwd=worktree, timeout=900, message="Maven 編譯失敗")
+    environment = maven_environment()
+    output = command(
+        arguments,
+        cwd=worktree,
+        timeout=900,
+        message="Maven 編譯失敗",
+        environment=environment,
+    )
     commands = [{"name": "compile", "command": " ".join(arguments), "output": output[-2_000:]}]
     if any(
         "maven-javadoc-plugin" in pom.read_text(encoding="utf-8")
@@ -399,7 +574,13 @@ def validate(repo: Path, payload: dict[str, Any]) -> dict[str, Any]:
         if "target" not in pom.parts
     ):
         arguments = [*maven, "-B", "-ntp", "-DskipTests", "javadoc:javadoc"]
-        output = command(arguments, cwd=worktree, timeout=900, message="Maven Javadoc 檢查失敗")
+        output = command(
+            arguments,
+            cwd=worktree,
+            timeout=900,
+            message="Maven Javadoc 檢查失敗",
+            environment=environment,
+        )
         commands.append(
             {"name": "javadoc", "command": " ".join(arguments), "output": output[-2_000:]}
         )

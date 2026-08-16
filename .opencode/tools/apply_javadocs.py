@@ -103,10 +103,24 @@ def load_state(repo: Path, worktree: str) -> dict[str, Any]:
     return state
 
 
+def primary_worktree(repo: Path) -> Path:
+    common = Path(git(repo, "rev-parse", "--git-common-dir"))
+    if not common.is_absolute():
+        common = repo / common
+    common = common.resolve()
+    if common.name != ".git" or not common.is_dir():
+        raise ApplyError("無法辨識主要 Git worktree")
+    return common.parent
+
+
 def resolve_worktree(repo: Path, relative: str) -> Path:
-    worktree = repo.joinpath(*PurePosixPath(relative).parts).resolve()
-    if worktree.parent != (repo / "javadoc-worktrees").resolve() or not worktree.is_dir():
+    root = primary_worktree(repo)
+    worktree = root.joinpath(*PurePosixPath(relative).parts).resolve()
+    if worktree.parent != (root / "javadoc-worktrees").resolve() or not worktree.is_dir():
         raise ApplyError("Javadoc worktree 不存在或路徑不合法")
+    execution_root = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
+    if execution_root not in (root.resolve(), worktree):
+        raise ApplyError("寫入工具不是從主要 worktree 或目標 Javadoc worktree 執行")
     return worktree
 
 
@@ -174,6 +188,19 @@ def declaration_name(node: Node, source: bytes) -> str:
     return node.type
 
 
+def declaration_line(node: Node) -> int:
+    name = node.child_by_field_name("name")
+    if name is not None:
+        return name.start_point.row + 1
+    if node.type in ("field_declaration", "constant_declaration"):
+        for item in walk(node):
+            if item.type == "variable_declarator":
+                name = item.child_by_field_name("name")
+                if name is not None:
+                    return name.start_point.row + 1
+    return node.start_point.row + 1
+
+
 def scan(source: bytes, path: str) -> list[Declaration]:
     try:
         source.decode("utf-8")
@@ -206,7 +233,7 @@ def scan(source: bytes, path: str) -> list[Declaration]:
             Declaration(
                 kind=node.type,
                 name=declaration_name(node, source),
-                line=node.start_point.row + 1,
+                line=declaration_line(node),
                 start=node.start_byte,
                 javadoc_start=javadoc[0] if javadoc else None,
                 javadoc_end=javadoc[1] if javadoc else None,
@@ -232,9 +259,11 @@ def normalize_javadoc(value: str) -> str:
     body = value.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
     if not body.strip():
         raise ApplyError("Javadoc 內文不得為空")
-    if body.lstrip().startswith("/**") or body.rstrip().endswith("*/"):
+    if "/**" in body or "*/" in body:
         raise ApplyError("Javadoc 只能提供內文，不得包含註解邊界")
-    if "\x00" in body or "*/" in body or re.search(r"\\u+", body):
+    if any(re.match(r"^[ \t]*\*", line) for line in body.split("\n")):
+        raise ApplyError("Javadoc 內文每行不得自行包含開頭星號")
+    if "\x00" in body or re.search(r"\\u+", body):
         raise ApplyError("Javadoc 內文包含不安全字元")
     return body
 

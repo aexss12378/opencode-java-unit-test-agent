@@ -3,6 +3,7 @@
   "default_agent": "unit-test-orchestrator",
   "permission": {
     "external_directory": "deny",
+    "run_javadocs": "deny",
     "prepare_javadoc_workspace": "deny",
     "apply_javadocs": "deny",
     "validate_javadocs": "deny",
