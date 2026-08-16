@@ -5,11 +5,20 @@ import java.time.Instant;
 import java.util.Objects;
 import org.springframework.stereotype.Component;
 
+/**
+ * Policy that enforces the order lifecycle transition table defined by
+ *  {@code docs/order-lifecycle-rules.md}. Uses the injected {@code Clock} to
+ *  evaluate payment deadlines in the {@code PAYMENT_PENDING} state.
+ */
 @Component
 public final class OrderLifecyclePolicy {
 
     private final Clock clock;
 
+    /**
+     * @param clock the clock used to determine the current time for deadline
+     *          evaluation; must not be null
+     */
     public OrderLifecyclePolicy(Clock clock) {
         this.clock = Objects.requireNonNull(clock, "clock");
     }

@@ -16,6 +16,22 @@ public final class OrderRequestFingerprint {
     private OrderRequestFingerprint() {
     }
 
+    /**
+     * Computes a stable SHA-256 fingerprint of the given order placement command.
+     *
+     * The fingerprint is formed by concatenating the canonical representations of
+     * {@code orderId}, {@code idempotencyKey}, {@code customerId}, {@code sku},
+     * {@code quantity}, {@code total.amount}, and {@code total.currency}, each
+     * prefixed with its UTF-8 byte length followed by a colon and terminated by
+     * a pipe character. The payment token is also included in the hash but is
+     * never persisted.
+     *
+     * <p>Returns the fingerprint as a lowercase hexadecimal string.
+     *
+     * @throws IllegalStateException if SHA-256 is unavailable (should not occur).
+     * @param command the order placement command to fingerprint.
+     * @return a lowercase hexadecimal SHA-256 digest of the canonical command representation.
+     */
     public static String sha256(OrderPlacementCommand command) {
         Objects.requireNonNull(command, "command");
 

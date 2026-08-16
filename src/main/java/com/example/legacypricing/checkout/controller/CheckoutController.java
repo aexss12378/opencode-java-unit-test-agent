@@ -14,12 +14,21 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+/**
+ * Spring controller that handles checkout requests to reserve inventory
+ * and create a payment deadline.
+ */
 @RestController
 @RequestMapping("/api/checkouts")
 public final class CheckoutController {
 
     private final CheckoutUseCase checkoutUseCase;
 
+    /**
+     * Creates the controller with the given use case.
+     *
+     * @param checkoutUseCase the checkout use case; must not be null
+     */
     public CheckoutController(CheckoutUseCase checkoutUseCase) {
         this.checkoutUseCase = Objects.requireNonNull(checkoutUseCase, "checkoutUseCase");
     }

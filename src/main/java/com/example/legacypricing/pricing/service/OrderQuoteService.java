@@ -9,6 +9,12 @@ import java.math.RoundingMode;
 import java.util.Objects;
 import org.springframework.stereotype.Service;
 
+/**
+ * Spring service that implements the order quote use case.
+ *
+ * Validates input parameters and calculates subtotal, discount, tax, shipping fee, and total
+ * for an order quote.
+ */
 @Service
 public final class OrderQuoteService implements OrderQuoteUseCase {
 
@@ -16,6 +22,13 @@ public final class OrderQuoteService implements OrderQuoteUseCase {
     private final ShippingFeeCalculator shippingFeeCalculator;
     private final PricingProperties properties;
 
+    /**
+     * Creates the service with the required calculators and pricing configuration.
+     *
+     * @param discountCalculator the discount calculator; must not be null
+     * @param shippingFeeCalculator the shipping fee calculator; must not be null
+     * @param properties the pricing configuration; must not be null
+     */
     public OrderQuoteService(
             DiscountCalculator discountCalculator,
             ShippingFeeCalculator shippingFeeCalculator,
