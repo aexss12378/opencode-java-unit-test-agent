@@ -222,6 +222,7 @@ class JavadocToolsTest(unittest.TestCase):
         )
         self.assertIn('skill:\n    "*": deny\n    javadoc: allow', worker)
         self.assertIn("先載入 `javadoc` Skill", worker)
+        self.assertIn("reasoning:\n  enabled: false", worker)
         self.assertTrue(skill.startswith("---\nname: javadoc\n"))
         self.assertIn("不得將單一實作、工廠方法或呼叫方式推廣", skill)
 
