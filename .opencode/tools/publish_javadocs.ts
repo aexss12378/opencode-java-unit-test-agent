@@ -1,9 +1,9 @@
 import { tool } from "@opencode-ai/plugin"
 import path from "node:path"
 
-async function runBackend(projectRoot: string, input: unknown, abort: AbortSignal) {
-  const child = Bun.spawn(["uv", "run", "--script", path.join(import.meta.dir, "publish_javadocs.py"), "--repo", projectRoot], {
-    cwd: projectRoot, env: { ...Bun.env, CI: "true", TERM: "dumb", PYTHONDONTWRITEBYTECODE: "1", UV_NO_PROGRESS: "1" },
+async function runBackend(root: string, input: unknown, abort: AbortSignal) {
+  const child = Bun.spawn(["uv", "run", "--script", path.join(import.meta.dir, "publish_javadocs.py"), "--repo", root], {
+    cwd: root, env: { ...Bun.env, CI: "true", TERM: "dumb", PYTHONDONTWRITEBYTECODE: "1", UV_NO_PROGRESS: "1" },
     stdin: "pipe", stdout: "pipe", stderr: "pipe",
   })
   child.stdin.write(JSON.stringify(input)); child.stdin.end()
@@ -18,7 +18,7 @@ async function runBackend(projectRoot: string, input: unknown, abort: AbortSigna
 }
 
 export default tool({
-  description: "將 validate_javadocs 通過的 Javadoc-only 變更建立單一提交、推送，並透過可替換發布介面建立 Draft PR。目前實作 GitHub。成功後清理 worktree，不會轉為 Ready 或合併。",
+  description: "將驗證通過的 Javadoc-only 變更建立單一提交、推送，並透過可替換介面建立 Draft PR。目前實作 GitHub；不會轉為 Ready 或合併。",
   args: {
     worktree: tool.schema.string().regex(/^javadoc-worktrees\/[0-9a-f-]{36}$/),
     publisher: tool.schema.enum(["github"]).default("github"),

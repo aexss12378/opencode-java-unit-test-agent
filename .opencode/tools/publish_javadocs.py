@@ -12,20 +12,99 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import subprocess
 import sys
+import tempfile
 from abc import ABC, abstractmethod
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
-from javadoc_common import (
-    JavadocError,
-    checked_command,
-    git,
-    load_state,
-    resolve_worktree,
-    save_state,
-)
+
+class JavadocError(RuntimeError):
+    pass
+
+
+def checked_command(
+    arguments: list[str], *, cwd: Path, message: str, timeout: int = 120
+) -> str:
+    try:
+        result = subprocess.run(
+            arguments,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError as error:
+        raise JavadocError(f"找不到必要指令：{arguments[0]}") from error
+    except subprocess.TimeoutExpired as error:
+        raise JavadocError(f"指令逾時：{' '.join(arguments)}") from error
+    if result.returncode != 0:
+        detail = (result.stdout + result.stderr).strip()[-4_000:]
+        raise JavadocError(message + (f"：{detail}" if detail else ""))
+    return result.stdout.strip()
+
+
+def git(repo: Path, *arguments: str, message: str = "Git 指令失敗") -> str:
+    return checked_command(
+        ["git", "-C", str(repo), *arguments], cwd=repo, message=message
+    )
+
+
+def normalize_path(value: str) -> str:
+    relative = PurePosixPath(value.strip())
+    if (
+        relative.is_absolute()
+        or any(part in ("", ".", "..") for part in relative.parts)
+        or "\\" in value
+    ):
+        raise JavadocError("worktree 路徑不合法")
+    return relative.as_posix()
+
+
+def state_file(repo: Path, worktree: str) -> Path:
+    parts = PurePosixPath(normalize_path(worktree)).parts
+    if len(parts) != 2 or parts[0] != "javadoc-worktrees":
+        raise JavadocError("worktree 格式不正確")
+    common = Path(git(repo, "rev-parse", "--git-common-dir"))
+    if not common.is_absolute():
+        common = repo / common
+    return common.resolve() / "opencode-javadoc" / f"{parts[1]}.json"
+
+
+def load_state(repo: Path, worktree: str) -> dict[str, Any]:
+    path = state_file(repo, worktree)
+    if not path.is_file():
+        raise JavadocError("找不到 Javadoc 執行狀態")
+    state = json.loads(path.read_text(encoding="utf-8"))
+    if state.get("worktree") != normalize_path(worktree):
+        raise JavadocError("執行狀態與 worktree 不一致")
+    return state
+
+
+def save_state(repo: Path, state: dict[str, Any]) -> None:
+    destination = state_file(repo, state["worktree"])
+    descriptor, temporary_name = tempfile.mkstemp(dir=destination.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(state, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def resolve_worktree(repo: Path, relative: str) -> Path:
+    worktree = repo.joinpath(*PurePosixPath(relative).parts).resolve()
+    if worktree.parent != (repo / "javadoc-worktrees").resolve() or not worktree.is_dir():
+        raise JavadocError("Javadoc worktree 不存在或路徑不合法")
+    return worktree
 
 
 class PullRequestPublisher(ABC):

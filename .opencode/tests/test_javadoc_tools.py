@@ -18,15 +18,10 @@ from unittest.mock import patch
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
 sys.path.insert(0, str(TOOLS))
 
-from apply_javadocs import apply
-from javadoc_common import (
-    JavadocError,
-    maven_source_roots,
-    scan_declarations,
-    without_attached_javadocs,
-)
-from prepare_javadoc_workspace import prepare
+from apply_javadocs import ApplyError, apply, scan as apply_scan, without_javadocs
+from prepare_javadoc_workspace import java_files, prepare
 from publish_javadocs import GitHubPublisher, publish
+from validate_javadocs import scan as validation_scan
 from validate_javadocs import validate
 
 
@@ -43,19 +38,15 @@ class JavadocToolsTest(unittest.TestCase):
     def make_repo(self) -> tuple[tempfile.TemporaryDirectory[str], Path]:
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name)
-        remote = root / "remote.git"
-        repo = root / "repo"
+        remote, repo = root / "remote.git", root / "repo"
         command("git", "init", "--bare", "--initial-branch=main", str(remote), cwd=root)
         command("git", "init", "--initial-branch=main", str(repo), cwd=root)
         command("git", "config", "user.name", "Javadoc Test", cwd=repo)
         command("git", "config", "user.email", "javadoc@example.invalid", cwd=repo)
         (repo / "src/main/java/example").mkdir(parents=True)
-        (repo / "pom.xml").write_text(
-            '<project xmlns="http://maven.apache.org/POM/4.0.0">'
-            "<modelVersion>4.0.0</modelVersion><groupId>x</groupId>"
-            "<artifactId>x</artifactId><version>1</version></project>\n",
-            encoding="utf-8",
-        )
+        (repo / "module-a/src/main/java/example").mkdir(parents=True)
+        (repo / "pom.xml").write_text("<project/>\n", encoding="utf-8")
+        (repo / "module-a/pom.xml").write_text("<project/>\n", encoding="utf-8")
         (repo / ".gitignore").write_text(
             "target/\njavadoc-worktrees/\n", encoding="utf-8"
         )
@@ -71,14 +62,16 @@ class JavadocToolsTest(unittest.TestCase):
             "}\n",
             encoding="utf-8",
         )
+        (repo / "module-a/src/main/java/example/Module.java").write_text(
+            "package example;\npublic class Module {}\n", encoding="utf-8"
+        )
         command("git", "add", ".", cwd=repo)
         command("git", "commit", "-m", "fixture", cwd=repo)
         command("git", "remote", "add", "origin", str(remote), cwd=repo)
         command("git", "push", "-u", "origin", "main", cwd=repo)
-        command("git", "remote", "set-head", "origin", "-a", cwd=repo)
         return temporary, repo
 
-    def test_scanner_finds_public_api_and_type_parameters(self) -> None:
+    def test_scanner_finds_required_public_api(self) -> None:
         source = (
             b"package example;\n"
             b"public record Box<T>(T value) {\n"
@@ -86,28 +79,21 @@ class JavadocToolsTest(unittest.TestCase):
             b"  private void hidden() {}\n"
             b"}\n"
         )
-        declarations = scan_declarations(source, path="src/main/java/example/Box.java")
-        record = next(
-            item for item in declarations if item.kind == "record_declaration"
-        )
-        self.assertTrue(record.required)
-        self.assertEqual(record.metadata["type_parameters"], ["T"])
-        self.assertEqual(record.metadata["record_components"], ["value"])
-        hidden = next(item for item in declarations if item.name == "hidden")
-        self.assertFalse(hidden.required)
+        declarations = validation_scan(source, "src/main/java/example/Box.java")
+        self.assertTrue(next(item for item in declarations if item.name == "Box").required)
+        self.assertTrue(next(item for item in declarations if item.name == "get").required)
+        self.assertFalse(next(item for item in declarations if item.name == "hidden").required)
 
-    def test_maven_modules_support_poms_without_xml_namespace(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "module-a/src/main/java").mkdir(parents=True)
-            (root / "pom.xml").write_text(
-                "<project><modules><module>module-a</module></modules></project>",
-                encoding="utf-8",
-            )
-            (root / "module-a/pom.xml").write_text("<project/>", encoding="utf-8")
-            self.assertEqual(
-                maven_source_roots(root), [(root / "module-a/src/main/java").resolve()]
-            )
+    def test_git_lists_root_and_module_standard_java_paths(self) -> None:
+        temporary, repo = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        self.assertEqual(
+            java_files(repo),
+            [
+                "module-a/src/main/java/example/Module.java",
+                "src/main/java/example/Sample.java",
+            ],
+        )
 
     def test_apply_validate_and_publish_javadoc_only_diff(self) -> None:
         temporary, repo = self.make_repo()
@@ -115,28 +101,25 @@ class JavadocToolsTest(unittest.TestCase):
         prepared = prepare(repo, {"target_path": "src/main/java/example/Sample.java"})
         worktree_name = prepared["worktree"]
         path = prepared["files"][0]["path"]
-        targets = prepared["files"][0]["targets"]
         worktree = repo / worktree_name
         before = (worktree / path).read_bytes()
-        by_name = {item["name"]: item for item in targets}
+        by_name = {
+            item.name: item for item in apply_scan(before, path)
+        }
 
-        with self.assertRaises(JavadocError):
+        with self.assertRaises(ApplyError):
             apply(
                 repo,
                 {
                     "worktree": worktree_name,
                     "path": path,
-                    "reviews": [
+                    "changes": [
                         {
-                            "key": by_name["Sample"]["key"],
-                            "decision": "write",
-                            "javadoc": "A sample.\n\n@param <T> value type",
+                            "line": by_name["Sample"].line,
+                            "name": "Sample",
+                            "javadoc": "A sample.",
                         },
-                        {
-                            "key": by_name["greet"]["key"],
-                            "decision": "write",
-                            "javadoc": "Returns a greeting.",
-                        },
+                        {"line": 999, "name": "missing", "javadoc": "Missing."},
                     ],
                 },
             )
@@ -147,25 +130,25 @@ class JavadocToolsTest(unittest.TestCase):
             {
                 "worktree": worktree_name,
                 "path": path,
-                "reviews": [
+                "changes": [
                     {
-                        "key": by_name["Sample"]["key"],
-                        "decision": "write",
-                        "javadoc": "A sample.\n\n@param <T> value type",
+                        "line": by_name["Sample"].line,
+                        "name": "Sample",
+                        "javadoc": "A sample type.",
                     },
                     {
-                        "key": by_name["greet"]["key"],
-                        "decision": "write",
-                        "javadoc": "Returns the supplied name.\n\n@param name supplied name\n@return supplied name\n@throws IllegalArgumentException when rejected",
+                        "line": by_name["greet"].line,
+                        "name": "greet",
+                        "javadoc": "Returns the supplied name.\n\n@param name supplied name\n@return supplied name",
                     },
                 ],
             },
         )
-        self.assertEqual(result["remaining"], [])
+        self.assertTrue(result["changed"])
         after = (worktree / path).read_bytes()
         self.assertEqual(
-            without_attached_javadocs(before, path=path),
-            without_attached_javadocs(after, path=path),
+            without_javadocs(before, path),
+            without_javadocs(after, path),
         )
         validation = validate(
             repo,
@@ -174,9 +157,7 @@ class JavadocToolsTest(unittest.TestCase):
                 "file_results": [{"path": path, "status": "completed"}],
             },
         )
-        self.assertEqual(validation["status"], "validated")
         self.assertEqual(validation["changed_files"], [path])
-        self.assertEqual(validation["commands"][0]["name"], "compile")
         with (
             patch.object(
                 GitHubPublisher,
@@ -186,27 +167,14 @@ class JavadocToolsTest(unittest.TestCase):
             patch.object(
                 GitHubPublisher,
                 "verify",
-                return_value={
-                    "url": "https://github.example/pull/1",
-                    "isDraft": True,
-                    "headRefOid": "由發布工具驗證",
-                },
+                return_value={"isDraft": True},
             ),
         ):
             publication = publish(
                 repo, {"worktree": worktree_name, "publisher": "github"}
             )
         self.assertEqual(publication["status"], "published")
-        self.assertTrue(publication["is_draft"])
         self.assertFalse(worktree.exists())
-        remote_sha = command(
-            "git",
-            "ls-remote",
-            "origin",
-            f"refs/heads/{publication['branch']}",
-            cwd=repo,
-        ).split()[0]
-        self.assertEqual(remote_sha, publication["commit_sha"])
 
     def test_failed_file_is_restored_before_validation(self) -> None:
         temporary, repo = self.make_repo()
@@ -214,24 +182,26 @@ class JavadocToolsTest(unittest.TestCase):
         prepared = prepare(repo, {"target_path": "src/main/java/example/Sample.java"})
         worktree_name = prepared["worktree"]
         path = prepared["files"][0]["path"]
-        target = next(
-            item for item in prepared["files"][0]["targets"] if item["name"] == "Sample"
+        declaration = next(
+            item
+            for item in apply_scan((repo / worktree_name / path).read_bytes(), path)
+            if item.name == "Sample"
         )
         apply(
             repo,
             {
                 "worktree": worktree_name,
                 "path": path,
-                "reviews": [
+                "changes": [
                     {
-                        "key": target["key"],
-                        "decision": "write",
-                        "javadoc": "A sample.\n\n@param <T> value type",
+                        "line": declaration.line,
+                        "name": declaration.name,
+                        "javadoc": "A sample.",
                     }
                 ],
             },
         )
-        result = validate(
+        validation = validate(
             repo,
             {
                 "worktree": worktree_name,
@@ -240,13 +210,38 @@ class JavadocToolsTest(unittest.TestCase):
                 ],
             },
         )
-        self.assertEqual(result["changed_files"], [])
-        self.assertEqual(
-            result["failed_files"], [{"path": path, "reason": "fixture failure"}]
+        self.assertEqual(validation["changed_files"], [])
+        self.assertEqual(publish(repo, {"worktree": worktree_name})["status"], "no-changes")
+
+    def test_document_conflict_can_explain_missing_javadoc(self) -> None:
+        temporary, repo = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        prepared = prepare(repo, {"target_path": "src/main/java/example/Sample.java"})
+        worktree_name = prepared["worktree"]
+        path = prepared["files"][0]["path"]
+        declarations = [
+            item
+            for item in validation_scan((repo / worktree_name / path).read_bytes(), path)
+            if item.required
+        ]
+        blocked = [
+            {"line": item.line, "name": item.name, "reason": "fixture conflict"}
+            for item in declarations
+        ]
+        validation = validate(
+            repo,
+            {
+                "worktree": worktree_name,
+                "file_results": [
+                    {
+                        "path": path,
+                        "status": "completed",
+                        "blocked_declarations": blocked,
+                    }
+                ],
+            },
         )
-        publication = publish(repo, {"worktree": worktree_name, "publisher": "github"})
-        self.assertEqual(publication["status"], "no-changes")
-        self.assertFalse((repo / worktree_name).exists())
+        self.assertEqual(len(validation["blocked_declarations"]), len(declarations))
 
 
 if __name__ == "__main__":

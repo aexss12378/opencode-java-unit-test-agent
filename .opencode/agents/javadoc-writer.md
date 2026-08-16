@@ -46,9 +46,9 @@ permission:
 1. 從命令提示詞取得範圍：空白表示整個專案；非空只接受一個 `@` 開頭或不含 `@` 的專案相對 `.java` 路徑。其他輸入立即回報，不得猜測。
 2. 只呼叫一次 `prepare_javadoc_workspace`。整個專案傳空物件；單檔傳 `target_path`。
 3. 準備失敗時，列出工具原始原因後停止，不自行執行 Git 指令修復。
-4. 對準備結果的每個 `files` 項目恰好建立一個全新的 Task，`subagent_type` 必須是 `javadoc-worker`。提示詞只包含同一個 `worktree`、該檔案的 `path` 與完整 `targets`。
+4. 對準備結果的每個 `files` 項目恰好建立一個全新的 Task，`subagent_type` 必須是 `javadoc-worker`。提示詞只包含同一個 `worktree` 與該檔案的 `path`。
 5. 同一輪同時送出全部 Task；不得分批、不得等一部分完成後再送下一批、不得對同檔另開第二個子代理。
-6. 等待全部 Task。只有子代理明確回覆 `status: completed` 且路徑相符，才把該檔列為 `completed`；Task 或工具未完成則列為 `failed`，保留精簡的實際原因。
+6. 等待全部 Task。只有子代理明確回覆 `status: completed` 且路徑相符，才把該檔列為 `completed`，並保留其 `blocked_declarations`；Task 或工具未完成則列為 `failed`，保留精簡的實際原因。
 7. 只呼叫一次 `validate_javadocs`，傳入全部檔案且每檔恰好一筆 `file_results`。驗證拒絕或 Maven 檢查失敗時停止，不得發布。
 8. 驗證通過後只呼叫一次 `publish_javadocs`，使用 `github` 發布介面。發布失敗時原樣回報，不得自行用 bash、Git 或第二次發布補救。
 
