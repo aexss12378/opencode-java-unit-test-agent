@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import shutil
 import subprocess
@@ -242,6 +243,80 @@ def run_maven(project: Path, candidate_class: str) -> dict[str, Any]:
     }
 
 
+def _source_locations(
+    stack: str, candidate_class: str, target_class: str
+) -> tuple[str | None, str | None]:
+    frame_pattern = re.compile(
+        r"\bat\s+([A-Za-z_$][\w$\.]*\.[A-Za-z_$][\w$]*)\."
+        r"([A-Za-z_$][\w$]*)\(([^():]+):(\d+)\)"
+    )
+    test_source = None
+    target_source = None
+    for line in stack.splitlines():
+        match = frame_pattern.search(line)
+        if match is None:
+            continue
+        class_name, method, file_name, line_number = match.groups()
+        location = f"{class_name}.{method}({file_name}:{line_number})"
+        if class_name == candidate_class or class_name.startswith(candidate_class + "$"):
+            test_source = test_source or location
+        if class_name == target_class or class_name.startswith(target_class + "$"):
+            target_source = target_source or location
+    return test_source, target_source
+
+
+def surefire_failures(
+    project: Path, candidate_class: str, target_class: str
+) -> dict[str, Any]:
+    """Extract only the compact, agent-relevant details from Surefire XML."""
+    failures: list[dict[str, Any]] = []
+    report_directory = project / "target/surefire-reports"
+    for report in sorted(report_directory.glob("TEST-*.xml")):
+        try:
+            root = ET.parse(report).getroot()
+        except (ET.ParseError, OSError):
+            continue
+        for testcase in root.iter():
+            if testcase.tag.rsplit("}", 1)[-1] != "testcase":
+                continue
+            class_name = testcase.attrib.get("classname", "")
+            if class_name != candidate_class and not class_name.startswith(
+                candidate_class + "$"
+            ):
+                continue
+            for detail in testcase:
+                kind = detail.tag.rsplit("}", 1)[-1]
+                if kind not in ("failure", "error"):
+                    continue
+                stack = detail.text or ""
+                test_source, target_source = _source_locations(
+                    stack, candidate_class, target_class
+                )
+                outputs = {
+                    child.tag.rsplit("}", 1)[-1]: child.text or ""
+                    for child in testcase
+                    if child.tag.rsplit("}", 1)[-1] in ("system-out", "system-err")
+                    and (child.text or "")
+                }
+                item: dict[str, Any] = {
+                    "test_class": class_name,
+                    "test": testcase.attrib.get("name", ""),
+                    "kind": "assertion-failure" if kind == "failure" else "runtime-error",
+                    "message": detail.attrib.get("message"),
+                    "test_source": test_source,
+                }
+                if kind == "error":
+                    item["exception"] = detail.attrib.get("type", "") or None
+                if target_source is not None:
+                    item["target_source"] = target_source
+                if "system-out" in outputs:
+                    item["system_out"] = outputs["system-out"]
+                if "system-err" in outputs:
+                    item["system_err"] = outputs["system-err"]
+                failures.append(item)
+    return {"failures": failures}
+
+
 def test_summary(project: Path, candidate_class: str) -> dict[str, Any]:
     tests = skipped = 0
     reports: list[str] = []
@@ -386,10 +461,31 @@ def validate(target: Target, data: dict[str, Any]) -> dict[str, Any]:
     }
     if maven["exit_code"] == 130 and cancelled():
         return failure("cancelled", "單元測試工作已取消。", target, validation)
+    if maven["timed_out"]:
+        return failure("validation-timeout", "Maven 驗證逾時。", target, validation)
     if maven["exit_code"] != 0:
+        failures = surefire_failures(
+            target.worktree, target.candidate_class, target.target_class
+        )
+        if failures["failures"]:
+            return failure(
+                "test-failed",
+                "候選測試有失敗案例，請依 surefire_failures 修正。",
+                target,
+                None,
+                diagnostic_field="surefire_failures",
+                surefire_failures=failures,
+            )
+        if not maven["maven_errors"]:
+            return failure(
+                "validation-tool-failed",
+                "Maven 失敗，但沒有 Surefire 失敗報告或可用編譯診斷；請停止重試並回報。",
+                target,
+                validation,
+            )
         return failure(
-            "candidate-check-failed",
-            "候選測試未通過 Maven test；請修正測試編譯或設定錯誤。可信規格與實作衝突時，不得修改預期結果迎合實作。",
+            "maven-failed",
+            "Maven 驗證失敗，請依 maven_errors 修正。",
             target,
             validation,
             diagnostic_field="maven_errors",

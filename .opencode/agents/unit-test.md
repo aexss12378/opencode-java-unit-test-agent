@@ -54,7 +54,10 @@ permission:
 1. 使用內建 `edit` 在指定 `worktree` 建立或更新唯一測試檔。
 2. 呼叫 `validate_unit_test`，傳入啟動提示詞的 `target_class`、`worktree` 與完整 `test_cases`。
 3. 驗證失敗時只可修改同一測試檔後重驗：
-   - 編譯、匯入或測試設定錯誤：依 `maven_errors` 修正。
+   - `validation-timeout`：停止重試並回報 Maven 驗證逾時；不得把它當成測試失敗、編譯錯誤或驗證工具錯誤。
+   - `test-failed`：依 `surefire_failures` 中的測試方法、斷言訊息、例外類型、測試位置、可選的 `target_source`、`system_out` 與 `system_err` 修正；不得自行要求或展開完整 XML、完整堆疊或 Maven 主控台。
+   - `maven-failed`：依 `maven_errors` 修正 Maven 驗證失敗；不得自行把它縮小解讀成 Java 編譯錯誤。
+   - `validation-tool-failed`：停止重試並回報；不得把它當成測試失敗或自行猜測原因。
    - `candidate-not-executed`：修正測試發現或跳過問題。
    - 覆蓋率不足：可依外部規格或目前可觀察行為補案例；JaCoCo 行號本身不是行為依據。
    - 規格與實作衝突：不得迎合實作，停止並如實回報。
