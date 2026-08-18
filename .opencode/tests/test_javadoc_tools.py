@@ -27,7 +27,6 @@ from validate_javadocs import (
     maven_environment,
     scan as validation_scan,
     validate,
-    validate_javadoc_quality,
 )
 
 
@@ -146,37 +145,6 @@ class JavadocToolsTest(unittest.TestCase):
                     },
                 )
             self.assertEqual(source_path.read_bytes(), before)
-
-    def test_validator_requires_method_param_return_and_description(self) -> None:
-        invalid = (
-            b"public class Sample {\n"
-            b"  /** Calculates a value. */\n"
-            b"  public String calculate(String input) { return input; }\n"
-            b"}\n"
-        )
-        with self.assertRaisesRegex(ValidationError, "缺少參數 @param"):
-            validate_javadoc_quality(
-                invalid,
-                "src/main/java/example/Sample.java",
-                validation_scan(invalid, "src/main/java/example/Sample.java"),
-            )
-
-        valid = (
-            b"public class Sample {\n"
-            b"  /**\n"
-            b"   * Calculates a value.\n"
-            b"   *\n"
-            b"   * @param input input value\n"
-            b"   * @return calculated value\n"
-            b"   */\n"
-            b"  public String calculate(String input) { return input; }\n"
-            b"}\n"
-        )
-        validate_javadoc_quality(
-            valid,
-            "src/main/java/example/Sample.java",
-            validation_scan(valid, "src/main/java/example/Sample.java"),
-        )
 
     def test_maven_environment_derives_java_home_from_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -343,95 +311,6 @@ class JavadocToolsTest(unittest.TestCase):
         )
         self.assertEqual(validation["changed_files"], [])
         self.assertEqual(publish(repo, {"worktree": worktree_name})["status"], "no-changes")
-
-    def test_file_quality_failure_does_not_block_valid_files(self) -> None:
-        temporary, repo = self.make_repo()
-        self.addCleanup(temporary.cleanup)
-        module_path = "module-a/src/main/java/example/Module.java"
-        (repo / module_path).write_text(
-            "package example;\n"
-            "public class Module {\n"
-            "  public String echo(String value) { return value; }\n"
-            "}\n",
-            encoding="utf-8",
-        )
-        command("git", "add", module_path, cwd=repo)
-        command("git", "commit", "-m", "use record fixture", cwd=repo)
-        command("git", "push", cwd=repo)
-
-        prepared = prepare(repo, {})
-        worktree_name = prepared["worktree"]
-        worktree = repo / worktree_name
-        sample_path = "src/main/java/example/Sample.java"
-        sample = {
-            item.name: item
-            for item in apply_scan((worktree / sample_path).read_bytes(), sample_path)
-        }
-        apply(
-            repo,
-            {
-                "worktree": worktree_name,
-                "path": sample_path,
-                "changes": [
-                    {
-                        "line": sample["Sample"].line,
-                        "name": "Sample",
-                        "javadoc": "A sample type.\n\n@param <T> value type",
-                    },
-                    {
-                        "line": sample["greet"].line,
-                        "name": "greet",
-                        "javadoc": "Returns a name.\n\n@param name name\n@return name",
-                    },
-                ],
-            },
-        )
-        module_declarations = {
-            item.name: item
-            for item in apply_scan((worktree / module_path).read_bytes(), module_path)
-        }
-        apply(
-            repo,
-            {
-                "worktree": worktree_name,
-                "path": module_path,
-                "changes": [
-                    {
-                        "line": module_declarations["Module"].line,
-                        "name": "Module",
-                        "javadoc": "A module value.",
-                    },
-                    {
-                        "line": module_declarations["echo"].line,
-                        "name": "echo",
-                        "javadoc": "Returns a value.",
-                    },
-                ],
-            },
-        )
-
-        validation = validate(
-            repo,
-            {
-                "worktree": worktree_name,
-                "file_results": [
-                    {"path": sample_path, "status": "completed"},
-                    {"path": module_path, "status": "completed"},
-                ],
-            },
-        )
-        self.assertEqual(validation["changed_files"], [sample_path])
-        self.assertEqual(
-            [item["path"] for item in validation["failed_files"]], [module_path]
-        )
-        self.assertIn("缺少參數 @param", validation["failed_files"][0]["reason"])
-        self.assertEqual(
-            (worktree / module_path).read_text(encoding="utf-8"),
-            "package example;\n"
-            "public class Module {\n"
-            "  public String echo(String value) { return value; }\n"
-            "}\n",
-        )
 
     def test_document_conflict_can_explain_missing_javadoc(self) -> None:
         temporary, repo = self.make_repo()

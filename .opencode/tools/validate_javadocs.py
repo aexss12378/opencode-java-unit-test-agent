@@ -56,9 +56,6 @@ class Declaration:
     javadoc_start: int | None
     javadoc_end: int | None
     required: bool
-    parameters: tuple[str, ...]
-    type_parameters: tuple[str, ...]
-    returns_value: bool
 
     @property
     def has_javadoc(self) -> bool:
@@ -313,27 +310,6 @@ def scan(source: bytes, path: str) -> list[Declaration]:
             if raw.startswith(b"/**") and not gap.strip():
                 javadoc_start = previous.start_byte
                 javadoc_end = previous.end_byte
-        parameters_node = node.child_by_field_name("parameters")
-        parameters = (
-            tuple(
-                text(parameter.child_by_field_name("name"), source)
-                for parameter in parameters_node.named_children
-                if parameter.child_by_field_name("name") is not None
-            )
-            if parameters_node is not None and node.type != "record_declaration"
-            else ()
-        )
-        type_parameters_node = node.child_by_field_name("type_parameters")
-        type_parameters = (
-            tuple(
-                text(parameter.child_by_field_name("name"), source)
-                for parameter in type_parameters_node.named_children
-                if parameter.child_by_field_name("name") is not None
-            )
-            if type_parameters_node is not None
-            else ()
-        )
-        return_type = node.child_by_field_name("type")
         declarations.append(
             Declaration(
                 kind=node.type,
@@ -343,83 +319,9 @@ def scan(source: bytes, path: str) -> list[Declaration]:
                 javadoc_start=javadoc_start,
                 javadoc_end=javadoc_end,
                 required=required(node, source, filename),
-                parameters=parameters,
-                type_parameters=type_parameters,
-                returns_value=(
-                    node.type
-                    in ("method_declaration", "annotation_type_element_declaration")
-                    and return_type is not None
-                    and text(return_type, source) != "void"
-                ),
             )
         )
     return declarations
-
-
-def validate_javadoc_quality(
-    source: bytes, path: str, declarations: list[Declaration]
-) -> None:
-    for declaration in declarations:
-        if not declaration.has_javadoc:
-            continue
-        assert declaration.javadoc_start is not None
-        assert declaration.javadoc_end is not None
-        raw = source[declaration.javadoc_start : declaration.javadoc_end].decode("utf-8")
-        if re.search(r"(?m)^[ \t]*\*[ \t]+\*", raw):
-            raise ValidationError(
-                f"{path} 的 {declaration.name}@{declaration.line} Javadoc 含多餘開頭星號"
-            )
-        if "{@inheritDoc}" in raw:
-            continue
-        body = raw[3:-2]
-        description_lines = []
-        for line in body.splitlines():
-            content = re.sub(r"^[ \t]*\*[ \t]?", "", line)
-            if re.match(r"^[ \t]*@[A-Za-z]+\b", content):
-                break
-            description_lines.append(content)
-        if not "".join(description_lines).strip():
-            raise ValidationError(
-                f"{path} 的 {declaration.name}@{declaration.line} Javadoc 缺少主要說明"
-            )
-        documented = set(
-            re.findall(
-                r"(?m)^[ \t]*\*[ \t]+@param[ \t]+([A-Za-z_$][\w$]*)\b",
-                raw,
-            )
-        )
-        missing = [
-            parameter
-            for parameter in declaration.parameters
-            if parameter not in documented
-        ]
-        if missing:
-            raise ValidationError(
-                f"{path} 的 {declaration.name}@{declaration.line} "
-                f"缺少參數 @param：{missing}"
-            )
-        documented_types = set(
-            re.findall(
-                r"(?m)^[ \t]*\*[ \t]+@param[ \t]+<([A-Za-z_$][\w$]*)>",
-                raw,
-            )
-        )
-        missing_types = [
-            parameter
-            for parameter in declaration.type_parameters
-            if parameter not in documented_types
-        ]
-        if missing_types:
-            raise ValidationError(
-                f"{path} 的 {declaration.name}@{declaration.line} "
-                f"缺少型別參數 @param：{missing_types}"
-            )
-        if declaration.returns_value and not re.search(
-            r"(?m)^[ \t]*\*[ \t]+@return\b", raw
-        ):
-            raise ValidationError(
-                f"{path} 的 {declaration.name}@{declaration.line} 缺少 @return"
-            )
 
 
 def without_javadocs(source: bytes, path: str) -> bytes:
@@ -485,7 +387,6 @@ def validate(repo: Path, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             source = (worktree / path).read_bytes()
             declarations = scan(source, path)
-            validate_javadoc_quality(source, path, declarations)
             blocked_identities = set()
             file_blocked = []
             for conflict in outcome["blocked"]:
