@@ -14,7 +14,7 @@ import argparse
 import json
 import os
 import re
-import shutil
+
 import subprocess
 import sys
 import tempfile
@@ -98,23 +98,12 @@ def git(repo: Path, *arguments: str, message: str = "Git 指令失敗") -> str:
 
 def maven_environment() -> dict[str, str]:
     environment = os.environ.copy()
-    configured = environment.get("JAVA_HOME")
-    if configured:
-        home = Path(configured)
-        if os.access(home / "bin/java", os.X_OK) and os.access(
-            home / "bin/javac", os.X_OK
-        ):
-            return environment
-
-    java = shutil.which("java")
-    javac = shutil.which("javac")
-    if java and javac:
-        java_home = Path(java).resolve().parent.parent
-        if (
-            os.access(java_home / "bin/java", os.X_OK)
-            and os.access(java_home / "bin/javac", os.X_OK)
-        ):
-            environment["JAVA_HOME"] = str(java_home)
+    java_home = environment.get("JAVA_HOME")
+    if not java_home:
+        raise ValidationError("JAVA_HOME 未設定，無法執行 Maven 編譯")
+    home = Path(java_home)
+    if not (os.access(home / "bin/java", os.X_OK) and os.access(home / "bin/javac", os.X_OK)):
+        raise ValidationError(f"JAVA_HOME 指向的 JDK 無效：{java_home}")
     return environment
 
 
@@ -324,7 +313,7 @@ def scan(source: bytes, path: str) -> list[Declaration]:
     return declarations
 
 
-def without_javadocs(source: bytes, path: str) -> bytes:
+def strip_javadocs(source: bytes, path: str) -> bytes:
     result = source
     ranges = {
         (item.javadoc_start, item.start)
@@ -355,18 +344,14 @@ def validate(repo: Path, payload: dict[str, Any]) -> dict[str, Any]:
             raise ValidationError("file_results 含未知或重複路徑")
         if status not in ("completed", "failed"):
             raise ValidationError("檔案狀態只能是 completed 或 failed")
-        blocked = item.get("blocked_declarations", [])
-        if not isinstance(blocked, list):
-            raise ValidationError("blocked_declarations 必須是陣列")
         outcomes[path] = {
             "status": status,
             "message": str(item.get("message", "")),
-            "blocked": blocked,
         }
     if set(outcomes) != expected:
         raise ValidationError(f"尚未回報所有檔案：{sorted(expected - set(outcomes))[:10]}")
 
-    failed, blocked_report, completed = [], [], set()
+    failed, completed = [], set()
 
     def reject_file(path: str, reason: str) -> None:
         git(
@@ -387,56 +372,25 @@ def validate(repo: Path, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             source = (worktree / path).read_bytes()
             declarations = scan(source, path)
-            blocked_identities = set()
-            file_blocked = []
-            for conflict in outcome["blocked"]:
-                if not isinstance(conflict, dict):
-                    raise ValidationError(f"{path} 的衝突宣告格式不正確")
-                line, name, reason = (
-                    conflict.get("line"),
-                    conflict.get("name"),
-                    conflict.get("reason"),
-                )
-                if (
-                    not isinstance(line, int)
-                    or not isinstance(name, str)
-                    or not str(reason).strip()
-                ):
-                    raise ValidationError(f"{path} 的衝突宣告缺少 line、name 或 reason")
-                if not any(
-                    item.line == line and item.name == name for item in declarations
-                ):
-                    raise ValidationError(f"{path} 找不到第 {line} 行宣告 {name}")
-                blocked_identities.add((line, name))
-                file_blocked.append(
-                    {
-                        "path": path,
-                        "line": line,
-                        "name": name,
-                        "reason": str(reason).strip(),
-                    }
-                )
             missing = [
                 item
                 for item in declarations
                 if item.required
                 and not item.has_javadoc
-                and (item.line, item.name) not in blocked_identities
             ]
             if missing:
                 raise ValidationError(
                     f"{path} 仍有必要宣告缺少 Javadoc："
                     f"{[f'{item.name}@{item.line}' for item in missing[:10]]}"
                 )
-            if without_javadocs(
+            if strip_javadocs(
                 git_blob(worktree, state["base_sha"], path), path
-            ) != without_javadocs(source, path):
+            ) != strip_javadocs(source, path):
                 raise ValidationError(f"{path} 含 Javadoc 以外的變更")
         except (ValidationError, OSError) as error:
             reject_file(path, f"檔案驗證失敗：{error}")
             continue
         completed.add(path)
-        blocked_report.extend(file_blocked)
 
     changed = [
         line
@@ -489,7 +443,6 @@ def validate(repo: Path, payload: dict[str, Any]) -> dict[str, Any]:
     validation = {
         "changed_files": changed,
         "failed_files": failed,
-        "blocked_declarations": blocked_report,
         "commands": commands,
     }
     state["status"] = "validated"
